@@ -1,0 +1,6 @@
+{
+  "name": "Bolão de Futebol",
+  "description": "Aplicativo de bolão de futebol para participar de grupos de amigos, fazer palpites de partidas, acompanhar rankings e comentar os jogos em tempo real.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
