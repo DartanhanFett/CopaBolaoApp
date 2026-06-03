@@ -8,7 +8,7 @@
 //  - API requests (/api/*): always network (don't cache live scores/predictions).
 // Bump CACHE_VERSION whenever you want to nuke all caches across all clients.
 
-const CACHE_VERSION = "copabolao-v2";
+const CACHE_VERSION = "copabolao-v3";
 const STATIC_CACHE = `${CACHE_VERSION}-static`;
 const STATIC_ASSETS = [
   "/",
@@ -40,6 +40,11 @@ self.addEventListener("fetch", (event) => {
   if (req.method !== "GET") return;
 
   const url = new URL(req.url);
+
+  // Only intercept same-origin requests. Letting the SW pass through external
+  // hosts (DiceBear, flagcdn, Supabase) means the browser handles them directly
+  // under page CSP — no SW-as-fetcher CSP weirdness.
+  if (url.origin !== self.location.origin) return;
 
   // Never cache API or auth — these are live data.
   if (url.pathname.startsWith("/api/")) return;

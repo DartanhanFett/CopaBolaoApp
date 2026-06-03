@@ -299,6 +299,12 @@ async function startServer() {
           "'self'",
           "https://*.supabase.co",
           "wss://*.supabase.co", // Supabase Realtime channels
+          // The service worker fetches images programmatically (cache-first strategy),
+          // so img hosts also need connect-src clearance — img-src alone isn't enough
+          // for SW-mediated requests.
+          "https://api.dicebear.com",
+          "https://flagcdn.com",
+          "https://images.unsplash.com",
         ],
         "img-src": [
           "'self'",
