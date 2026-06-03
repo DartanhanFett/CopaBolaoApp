@@ -18,10 +18,21 @@ primary_region = 'gru'
 [http_service]
   internal_port = 3000
   force_https = true
-  auto_stop_machines = 'stop'
+  # auto_stop disabled for the demo phase — 502s during cold start were hurting UX.
+  # Re-enable later if cost becomes a concern (free tier handles 1 VM always-on fine).
+  auto_stop_machines = 'off'
   auto_start_machines = true
-  min_machines_running = 0
+  min_machines_running = 1
   processes = ['app']
+
+  # Health check so Fly can detect a crashed Node process and restart it.
+  # `/` returns the SPA index.html quickly when the server is healthy.
+  [[http_service.checks]]
+    grace_period = "10s"
+    interval = "30s"
+    method = "GET"
+    timeout = "5s"
+    path = "/"
 
 [[vm]]
   memory = '1gb'

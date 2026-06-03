@@ -275,6 +275,13 @@ class SyncMutex {
 async function startServer() {
   const app = express();
 
+  // Trust the first proxy hop. Required behind Fly.io / Railway / Render / nginx —
+  // those platforms inject X-Forwarded-For with the real client IP. Without this:
+  //   - express-rate-limit throws ERR_ERL_UNEXPECTED_X_FORWARDED_FOR
+  //   - req.ip returns the proxy's IP, not the real client
+  // Single-hop is correct for our deploys; if we ever stack more proxies, bump this.
+  app.set("trust proxy", 1);
+
   // --- Security Headers (Helmet) ---
   // CSP allowlist — keep this in sync with hosts the app actually contacts:
   //   - *.supabase.co     → Supabase auth + database (PostgREST + Realtime WebSockets)
@@ -358,13 +365,20 @@ async function startServer() {
   // already-authenticated user (the bearer token is validated separately in authenticateRequest).
   // Falls back to anon if no service role is set — most reads still work, writes that need RLS
   // bypass will fail silently. Add SUPABASE_SERVICE_ROLE_KEY to .env to fix that.
+  // realtime.params: disable Realtime client on the server — it requires WebSocket support
+  // not present in Node 20, and we only use Realtime from the browser anyway. Without this,
+  // any /api/* call that lazy-creates the client crashes with "Node.js 20 detected without
+  // native WebSocket support".
   let supabaseInstance: any = null;
   function getSupabaseClient() {
     if (!supabaseInstance) {
       const url = process.env.SUPABASE_URL;
       const key = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY;
       if (url && key) {
-        supabaseInstance = createClient(url, key);
+        supabaseInstance = createClient(url, key, {
+          auth: { persistSession: false, autoRefreshToken: false },
+          realtime: { params: { eventsPerSecond: 0 } },
+        });
       }
     }
     return supabaseInstance;

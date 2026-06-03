@@ -2,7 +2,10 @@
 # Multi-stage to keep the final image small (~200 MB instead of ~1 GB).
 
 # ─── Stage 1: build ───────────────────────────────────────────────────────────
-FROM node:20-alpine AS builder
+# Node 22+ required: Supabase Realtime client uses native WebSocket which only
+# exists in Node 22+. Node 20 crashes on createClient() with "Node.js 20 detected
+# without native WebSocket support".
+FROM node:22-alpine AS builder
 
 WORKDIR /app
 
@@ -25,7 +28,7 @@ COPY . .
 RUN npm run build
 
 # ─── Stage 2: runtime ─────────────────────────────────────────────────────────
-FROM node:20-alpine AS runner
+FROM node:22-alpine AS runner
 
 WORKDIR /app
 ENV NODE_ENV=production
