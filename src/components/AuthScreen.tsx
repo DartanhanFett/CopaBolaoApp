@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Mail, User, Sparkles, ArrowRight, Check, AlertCircle, ArrowLeft, KeyRound } from 'lucide-react';
+import { Mail, User, Sparkles, ArrowRight, Check, AlertCircle, ArrowLeft, MailCheck, ExternalLink } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { getSupabase } from '../../lib/supabase/client';
 import { apiJson } from '../lib/api';
@@ -79,7 +79,7 @@ export default function AuthScreen({ onLoginSuccess }: AuthScreenProps) {
           : 'Erro ao enviar o código de acesso. Tente novamente.';
         throw new Error(friendly);
       }
-      setSuccessMsg('Código enviado! Verifique seu e-mail (e a pasta de spam).');
+      setSuccessMsg('Link enviado! Confira seu e-mail (incluindo a pasta de spam).');
       setStep('otp');
     } catch (err: any) {
       setErrorMsg(err.message || 'Erro de conexão ao solicitar OTP.');
@@ -182,7 +182,7 @@ export default function AuthScreen({ onLoginSuccess }: AuthScreenProps) {
               CopaBolão <span className="text-emerald-400 font-medium text-xs font-mono">PWA</span>
             </h1>
             <p className="text-xs text-slate-400 max-w-xs mx-auto" id="auth-desc">
-              Sem senhas fracas! Use o código mágico direto em seu e-mail para palpitar e gerenciar liguas da Copa.
+              Sem senhas fracas! Receba um link de acesso direto no seu e-mail para palpitar e gerenciar bolões da Copa.
             </p>
           </div>
         </div>
@@ -312,7 +312,7 @@ export default function AuthScreen({ onLoginSuccess }: AuthScreenProps) {
                     <span>Enviando código...</span>
                   ) : (
                     <>
-                      <span>{isSignUp ? 'Solicitar Código de Cadastro' : 'Receber Código por E-mail'}</span>
+                      <span>{isSignUp ? 'Criar Conta e Receber Link' : 'Receber Link de Acesso'}</span>
                       <ArrowRight className="w-4 h-4" />
                     </>
                   )}
@@ -334,81 +334,90 @@ export default function AuthScreen({ onLoginSuccess }: AuthScreenProps) {
                   </button>
                 </div>
 
-                <div className="text-center space-y-1 mb-4" id="otp-instruction-header">
-                  <h3 className="text-sm font-bold text-white flex items-center justify-center gap-1.5">
-                    <KeyRound className="w-4 h-4 text-emerald-400" />
-                    <span>Digite o Código de Segurança</span>
+                {/* Email-link flow: Supabase free tier sends a magic-link email (not a 6-digit code).
+                    The user clicks the link in the email and lands back here authenticated.
+                    No code input — keeps the UX honest about what actually happens. */}
+                <div className="bg-emerald-500/5 border border-emerald-500/20 rounded-2xl p-5 text-center space-y-3" id="otp-instruction-card">
+                  <div className="w-12 h-12 mx-auto bg-emerald-500/15 border border-emerald-500/25 rounded-2xl flex items-center justify-center">
+                    <MailCheck className="w-6 h-6 text-emerald-400" />
+                  </div>
+
+                  <h3 className="text-base font-extrabold text-white">
+                    Confira seu e-mail
                   </h3>
-                  <p className="text-xs text-slate-400">
-                    Enviamos um código para o endereço <strong className="text-emerald-400">{email}</strong>.
+
+                  <p className="text-xs text-slate-300 leading-relaxed">
+                    Enviamos um link de acesso para
+                    <br />
+                    <strong className="text-emerald-400">{email}</strong>
                   </p>
+
+                  <div className="bg-slate-950/60 border border-slate-800 rounded-xl p-3 text-left text-[11px] text-slate-300 space-y-2 leading-relaxed">
+                    <p className="font-bold text-emerald-400 flex items-center gap-1.5">
+                      <ExternalLink className="w-3 h-3" />
+                      Como entrar:
+                    </p>
+                    <ol className="list-decimal list-inside space-y-1 text-slate-400">
+                      <li>Abra o e-mail que acabou de chegar (verifique também a pasta de spam).</li>
+                      <li>Clique no botão / link <strong className="text-slate-200">"Sign in"</strong>.</li>
+                      <li>Você será redirecionado de volta já autenticado.</li>
+                    </ol>
+                    <p className="text-[10px] text-slate-500 pt-1 border-t border-slate-800/60">
+                      Importante: clique no link no <strong>mesmo dispositivo</strong> em que você está abrindo o app.
+                    </p>
+                  </div>
                 </div>
 
-                <form onSubmit={handleVerifyOtp} className="space-y-4" id="form-verify-otp">
-                  <div className="space-y-2">
-                    <label className="block text-center text-xs font-bold text-slate-500 uppercase tracking-wider">
-                      Código de 6 dígitos
-                    </label>
+                {/* Mock-mode helper — only shown when running without Supabase configured.
+                    Lets local devs continue testing without setting up secrets. */}
+                {!hasSupabase && (
+                  <div className="bg-amber-500/10 border border-amber-500/20 text-amber-400 rounded-xl p-3 text-xs flex flex-col gap-2 text-center" id="mock-badge">
+                    <span className="font-bold">🧪 Modo simulação (sem Supabase)</span>
+                    <p className="text-[10.5px] opacity-80">
+                      Configure VITE_SUPABASE_URL/VITE_SUPABASE_ANON_KEY no .env para OTP real. Por enquanto, digite <strong>123456</strong> abaixo:
+                    </p>
                     <input
                       type="text"
                       pattern="[0-9]*"
                       inputMode="numeric"
-                      required
                       maxLength={6}
-                      placeholder="000000"
+                      placeholder="123456"
                       value={otpToken}
                       onChange={(e) => setOtpToken(e.target.value.replace(/[^0-9]/g, ''))}
-                      className="w-full text-center font-mono font-extrabold text-2xl tracking-[0.5em] py-3 bg-slate-950 border border-slate-800 focus:border-emerald-500 rounded-xl outline-none transition text-emerald-300"
-                      id="input-otp"
+                      className="w-full text-center font-mono font-bold text-base tracking-[0.4em] py-2 bg-slate-950 border border-slate-800 rounded-lg outline-none text-amber-300"
                     />
+                    <button
+                      type="button"
+                      onClick={(e) => handleVerifyOtp(e as any)}
+                      disabled={isLoading}
+                      className="bg-amber-500 hover:bg-amber-400 disabled:opacity-50 text-slate-950 py-1.5 rounded-lg font-mono font-bold transition active:scale-95"
+                    >
+                      {isLoading ? 'Validando...' : 'Entrar (modo simulação)'}
+                    </button>
                   </div>
+                )}
 
-                  {!hasSupabase && (
-                    <div className="bg-amber-500/10 border border-amber-500/20 text-amber-400 rounded-xl p-3 text-xs flex flex-col gap-1 text-center" id="mock-badge">
-                      <span className="font-bold">🧪 Modo simulação (sem Supabase configurado)</span>
-                      <p className="text-[10.5px] opacity-80">
-                        Configure VITE_SUPABASE_URL/VITE_SUPABASE_ANON_KEY no .env para OTP real. Por enquanto use:
-                      </p>
-                      <button
-                        type="button"
-                        onClick={() => setOtpToken('123456')}
-                        className="mt-1 bg-amber-500 text-slate-950 py-1 px-2 rounded-lg font-mono font-bold hover:bg-amber-400 active:scale-95 transition"
-                      >
-                        Autopreencher 123456
-                      </button>
-                    </div>
-                  )}
+                {errorMsg && (
+                  <div className="p-3 bg-rose-500/10 border border-rose-500/30 rounded-lg text-xs font-semibold text-rose-400 flex items-center gap-2" id="verify-error">
+                    <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />
+                    <span>{errorMsg}</span>
+                  </div>
+                )}
 
-                  {errorMsg && (
-                    <div className="p-3 bg-rose-500/10 border border-rose-500/30 rounded-lg text-xs font-semibold text-rose-400 flex items-center gap-2" id="verify-error">
-                      <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />
-                      <span>{errorMsg}</span>
-                    </div>
-                  )}
+                {successMsg && (
+                  <div className="p-3 bg-emerald-500/10 border border-emerald-500/30 rounded-lg text-xs font-semibold text-emerald-400 flex items-center gap-2" id="verify-success">
+                    <Check className="w-4 h-4 text-emerald-400 shrink-0" />
+                    <span>{successMsg}</span>
+                  </div>
+                )}
 
-                  {successMsg && (
-                    <div className="p-3 bg-emerald-500/10 border border-emerald-500/30 rounded-lg text-xs font-semibold text-emerald-400 flex items-center gap-2" id="verify-success">
-                      <Check className="w-4 h-4 text-emerald-400 shrink-0" />
-                      <span>{successMsg}</span>
-                    </div>
-                  )}
-
-                  <button
-                    type="submit"
-                    disabled={isLoading}
-                    className="w-full py-2.5 bg-gradient-to-r from-emerald-500 to-lime-400 hover:from-emerald-400 hover:to-lime-300 disabled:from-slate-800 disabled:to-slate-800 disabled:text-slate-600 transition font-extrabold text-slate-950 text-xs rounded-xl shadow-lg shadow-emerald-500/10 hover:shadow-emerald-500/20 active:scale-95 flex items-center justify-center gap-2"
-                    id="btn-submit-verify"
-                  >
-                    {isLoading ? (
-                      <span>Validando...</span>
-                    ) : (
-                      <>
-                        <span>Confirmar Código e Entrar ⚽</span>
-                        <ArrowRight className="w-4 h-4" />
-                      </>
-                    )}
-                  </button>
-                </form>
+                <button
+                  type="button"
+                  onClick={() => { setStep('form'); setOtpToken(''); setSuccessMsg(''); setErrorMsg(''); }}
+                  className="w-full py-2 px-3 bg-slate-800 hover:bg-slate-750 border border-slate-700 text-slate-300 font-bold text-xs rounded-xl transition"
+                >
+                  Não recebi o e-mail — reenviar
+                </button>
               </div>
             </div>
           )}
