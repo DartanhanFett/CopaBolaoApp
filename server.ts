@@ -276,8 +276,43 @@ async function startServer() {
   const app = express();
 
   // --- Security Headers (Helmet) ---
+  // CSP allowlist — keep this in sync with hosts the app actually contacts:
+  //   - *.supabase.co     → Supabase auth + database (PostgREST + Realtime WebSockets)
+  //   - api.dicebear.com  → user avatars (svg)
+  //   - flagcdn.com       → country flags for matches
+  //   - data:             → inline data URIs used by some lucide-react icons
+  // We extend Helmet's default policy instead of disabling it. unsafe-inline on
+  // styles is required by Tailwind v4 dev-friendly mode and lucide-react.
   app.use(helmet({
-    contentSecurityPolicy: process.env.NODE_ENV === "production" ? undefined : false,
+    contentSecurityPolicy: {
+      useDefaults: true,
+      directives: {
+        "default-src": ["'self'"],
+        "connect-src": [
+          "'self'",
+          "https://*.supabase.co",
+          "wss://*.supabase.co", // Supabase Realtime channels
+        ],
+        "img-src": [
+          "'self'",
+          "data:",
+          "blob:",
+          "https://api.dicebear.com",
+          "https://flagcdn.com",
+          "https://images.unsplash.com",
+        ],
+        "script-src": ["'self'"],
+        "style-src": ["'self'", "'unsafe-inline'"],
+        "font-src": ["'self'", "data:"],
+        "frame-ancestors": ["'none'"],
+        "base-uri": ["'self'"],
+        "form-action": ["'self'"],
+        // Don't force HTTPS upgrades on the dev tunnel; in prod, Fly already does HTTPS.
+        "upgrade-insecure-requests": process.env.NODE_ENV === "production" ? [] : null,
+      },
+    },
+    // Cross-Origin-Embedder-Policy off — we don't need it and it breaks 3rd-party images.
+    crossOriginEmbedderPolicy: false,
   }));
 
   // --- CORS Configuration ---
