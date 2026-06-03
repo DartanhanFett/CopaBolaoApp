@@ -6,3 +6,12 @@ coverage/
 *.log
 .env*
 !.env.example
+
+# Sentry Config File
+.env.sentry-build-plugin
+
+# Next.js build output
+.next/
+
+# Next.js telemetry
+.telemetry.json
