@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0f172a"/>
+      <stop offset="100%" stop-color="#020617"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="50%" cy="40%" r="60%">
+      <stop offset="0%" stop-color="#10b981" stop-opacity="0.35"/>
+      <stop offset="100%" stop-color="#10b981" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect width="512" height="512" rx="96" fill="url(#bg)"/>
+  <circle cx="256" cy="220" r="180" fill="url(#glow)"/>
+  <!-- Soccer ball (white + black pentagons) -->
+  <g transform="translate(256 256)">
+    <circle r="160" fill="#f8fafc" stroke="#10b981" stroke-width="8"/>
+    <!-- Center pentagon -->
+    <polygon points="0,-58 55,-18 34,48 -34,48 -55,-18" fill="#0f172a"/>
+    <!-- Surrounding lines -->
+    <line x1="0" y1="-58" x2="0" y2="-145" stroke="#0f172a" stroke-width="6" stroke-linecap="round"/>
+    <line x1="55" y1="-18" x2="138" y2="-46" stroke="#0f172a" stroke-width="6" stroke-linecap="round"/>
+    <line x1="34" y1="48" x2="86" y2="120" stroke="#0f172a" stroke-width="6" stroke-linecap="round"/>
+    <line x1="-34" y1="48" x2="-86" y2="120" stroke="#0f172a" stroke-width="6" stroke-linecap="round"/>
+    <line x1="-55" y1="-18" x2="-138" y2="-46" stroke="#0f172a" stroke-width="6" stroke-linecap="round"/>
+  </g>
+  <!-- Sparkle accent -->
+  <g transform="translate(380 130)" fill="#a3e635">
+    <circle r="10"/>
+    <path d="M0,-20 L4,-4 L20,0 L4,4 L0,20 L-4,4 L-20,0 L-4,-4 Z" opacity="0.7"/>
+  </g>
+</svg>

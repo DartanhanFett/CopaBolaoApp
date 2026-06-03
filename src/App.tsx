@@ -16,17 +16,37 @@ import CreateGroupModal from './components/CreateGroupModal';
 import SimulatorPanel from './components/SimulatorPanel';
 import AuthScreen from './components/AuthScreen';
 import UserProfile from './components/UserProfile';
+import WelcomeModal from './components/WelcomeModal';
+import { apiFetch, apiJson } from './lib/api';
+import { getSupabase } from '../lib/supabase/client';
+import { DEFAULT_GROUP } from './data/constants';
+
+const DEFAULT_GROUP_CODE = DEFAULT_GROUP.code;
 
 export default function App() {
-  // Configurable session user state
-  const [sessionUser, setSessionUser] = useState<User | null>(() => {
-    const saved = localStorage.getItem('copabolao_session_user');
-    return saved ? JSON.parse(saved) : null; // Defaults to null so users must register/login
-  });
+  // Session user is derived from Supabase auth + /api/auth/me — never persisted standalone in localStorage.
+  const [sessionUser, setSessionUser] = useState<User | null>(null);
+  const [authChecked, setAuthChecked] = useState(false);
 
   const [users, setUsers] = useState<User[]>(() => {
+    // Cache only — populated by /api/db/sync from Supabase. Don't fall back to mocks
+    // because they leak fake names into the leaderboard ("Lucas", "Bia"...) when the
+    // server returns nothing.
+    // One-time migration: if the cached list contains the legacy mock IDs (u1/u2/u3...),
+    // wipe it. Real Supabase users use email as id, so any 'u<digit>' is stale data.
     const saved = localStorage.getItem('copabolao_users_list');
-    return saved ? JSON.parse(saved) : INITIAL_USERS;
+    if (!saved) return [];
+    try {
+      const parsed: User[] = JSON.parse(saved);
+      const hasLegacyMock = parsed.some((u) => /^u\d+$/i.test(u.id));
+      if (hasLegacyMock) {
+        localStorage.removeItem('copabolao_users_list');
+        return [];
+      }
+      return parsed;
+    } catch {
+      return [];
+    }
   });
 
   // Global States loaded with realistic presets
@@ -66,41 +86,39 @@ export default function App() {
     localStorage.setItem('copabolao_use_real_football', active ? 'true' : 'false');
   };
 
-  const currentUser: User = sessionUser || INITIAL_USERS[0];
+  // Defensive default: if /api/auth/me hasn't populated sessionUser yet, render with
+  // a placeholder rather than crashing on null. The auth gate above this component
+  // ensures we never actually render this branch in normal flow.
+  const currentUser: User = sessionUser || { id: '', name: '', avatar: '', email: '' };
 
   // --- Supabase Persistence Helper Triggers (Proxy REST) ---
   const savePredictionToDb = (pred: Prediction) => {
-    fetch("/api/db/predictions", {
+    apiFetch("/api/db/predictions", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
       body: JSON.stringify(pred)
     }).catch(e => console.error("Falha ao salvar palpite no Supabase:", e));
   };
 
   const saveCommentToDb = (comment: Comment) => {
-    fetch("/api/db/comments", {
+    apiFetch("/api/db/comments", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
       body: JSON.stringify(comment)
     }).catch(e => console.error("Falha ao salvar comentário no Supabase:", e));
   };
 
   const saveGroupToDb = (group: Group) => {
-    fetch("/api/db/groups", {
+    apiFetch("/api/db/groups", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
       body: JSON.stringify(group)
     }).catch(e => console.error("Falha ao salvar grupo no Supabase:", e));
   };
 
   const deleteGroupFromDb = async (groupId: string): Promise<boolean> => {
     try {
-      const response = await fetch("/api/db/groups/delete", {
+      const data = await apiJson<{ success?: boolean }>("/api/db/groups/delete", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ groupId, userId: currentUser?.id })
       });
-      const data = await response.json();
       return !!data.success;
     } catch (e) {
       console.error("Falha ao deletar grupo no Supabase:", e);
@@ -110,12 +128,10 @@ export default function App() {
 
   const deleteUserFromDb = async (targetUserId: string): Promise<boolean> => {
     try {
-      const response = await fetch("/api/db/users/delete", {
+      const data = await apiJson<{ success?: boolean }>("/api/db/users/delete", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ targetUserId, requesterUserId: currentUser?.id })
       });
-      const data = await response.json();
       return !!data.success;
     } catch (e) {
       console.error("Falha ao deletar usuário no Supabase:", e);
@@ -125,13 +141,14 @@ export default function App() {
 
   const handleDeleteGroup = async (groupId: string) => {
     try {
-      const response = await fetch("/api/db/groups/delete", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ groupId, userId: currentUser?.id })
-      });
-      const data = await response.json();
-      
+      const data = await apiJson<{ success?: boolean; message?: string }>(
+        "/api/db/groups/delete",
+        {
+          method: "POST",
+          body: JSON.stringify({ groupId, userId: currentUser?.id })
+        }
+      );
+
       if (data.success) {
         setGroups(prev => {
           const updated = prev.filter(g => g.id !== groupId);
@@ -198,13 +215,14 @@ export default function App() {
     if (!currentUser) return;
     const targetId = currentUser.id;
     try {
-      const response = await fetch("/api/db/users/delete", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ targetUserId: targetId, requesterUserId: currentUser.id })
-      });
-      const data = await response.json();
-      
+      const data = await apiJson<{ success?: boolean; message?: string }>(
+        "/api/db/users/delete",
+        {
+          method: "POST",
+          body: JSON.stringify({ targetUserId: targetId, requesterUserId: currentUser.id })
+        }
+      );
+
       if (data.success) {
         toast.success(data.message || "Sua conta foi excluída com sucesso.");
         setUsers(prev => {
@@ -212,8 +230,8 @@ export default function App() {
           localStorage.setItem('copabolao_users_list', JSON.stringify(updated));
           return updated;
         });
+        await getSupabase()?.auth.signOut();
         setSessionUser(null);
-        localStorage.removeItem('copabolao_session_user');
       } else {
         toast.error("Não foi possível excluir sua conta: " + (data.message || "Erro desconhecido."));
       }
@@ -225,24 +243,22 @@ export default function App() {
         localStorage.setItem('copabolao_users_list', JSON.stringify(updated));
         return updated;
       });
+      await getSupabase()?.auth.signOut();
       setSessionUser(null);
-      localStorage.removeItem('copabolao_session_user');
       toast.success("Sua conta foi excluída localmente devido a problemas de rede.");
     }
   };
 
   const saveUserToDb = (user: User) => {
-    fetch("/api/db/users", {
+    apiFetch("/api/db/users", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
       body: JSON.stringify(user)
     }).catch(e => console.error("Falha ao salvar usuário no Supabase:", e));
   };
 
   const saveMatchToDb = (match: Match) => {
-    fetch("/api/db/matches", {
+    apiFetch("/api/db/matches", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
       body: JSON.stringify(match)
     }).catch(e => console.error("Falha ao salvar partida no Supabase:", e));
   };
@@ -291,23 +307,51 @@ export default function App() {
   // Auto Refresh Interval setup
   const [isSyncing, setIsSyncing] = useState(false);
   const [isFirstSyncDone, setIsFirstSyncDone] = useState(false);
+
+  /**
+   * Merge two arrays of records by id, preferring the server's version when present.
+   * Records that exist only locally (e.g. matches created custom client-side that haven't
+   * propagated to Supabase yet) are preserved instead of being wiped on each sync.
+   */
+  const mergeById = <T extends { id: string }>(local: T[], server: T[]): T[] => {
+    const byId = new Map<string, T>();
+    for (const item of local) byId.set(item.id, item);
+    for (const item of server) byId.set(item.id, item);
+    return Array.from(byId.values());
+  };
+
   const syncData = async (silent = true) => {
     try {
       if (!silent) setIsSyncing(true);
       const [matchesRes, usersRes, predictionsRes, commentsRes, groupsRes] = await Promise.all([
-        fetch("/api/db/sync?table=copabolao_matches").then(res => res.json()),
-        fetch("/api/db/sync?table=copabolao_users").then(res => res.json()),
-        fetch("/api/db/sync?table=copabolao_predictions").then(res => res.json()),
-        fetch("/api/db/sync?table=copabolao_comments").then(res => res.json()),
-        fetch("/api/db/sync?table=copabolao_groups").then(res => res.json()),
+        apiJson<any>("/api/db/sync?table=copabolao_matches"),
+        apiJson<any>("/api/db/sync?table=copabolao_users"),
+        apiJson<any>("/api/db/sync?table=copabolao_predictions"),
+        apiJson<any>("/api/db/sync?table=copabolao_comments"),
+        apiJson<any>("/api/db/sync?table=copabolao_groups"),
       ]);
 
-      if (matchesRes.success && matchesRes.data.length > 0) setMatches(matchesRes.data);
-      if (usersRes.success && usersRes.data.length > 0) setUsers(usersRes.data);
-      if (predictionsRes.success && predictionsRes.data.length > 0) setPredictions(predictionsRes.data);
-      if (commentsRes.success && commentsRes.data.length > 0) setComments(commentsRes.data);
-      if (groupsRes.success && groupsRes.data.length > 0) setGroups(groupsRes.data);
-      
+      // Merge instead of replacing — keeps local-only records (custom matches, optimistic
+      // writes) visible even when the server returns a smaller list. We only fall back
+      // to a hard replace if the server returns NO data at all (success=false).
+      if (matchesRes.success) {
+        setMatches((prev) => mergeById(prev, matchesRes.data || []));
+      }
+      if (usersRes.success) {
+        setUsers((prev) => mergeById(prev, usersRes.data || []));
+      }
+      if (predictionsRes.success) {
+        // Predictions are server-canonical (no local-only ones survive long), so we replace
+        // when there's data. Empty arrays don't clobber so the UI doesn't flash empty.
+        if ((predictionsRes.data || []).length > 0) setPredictions(predictionsRes.data);
+      }
+      if (commentsRes.success) {
+        if ((commentsRes.data || []).length > 0) setComments(commentsRes.data);
+      }
+      if (groupsRes.success) {
+        setGroups((prev) => mergeById(prev, groupsRes.data || []));
+      }
+
       if (!silent) toast.success("Sincronizado com os servidores!");
     } catch (e) {
       console.error("Error doing background sync:", e);
@@ -319,13 +363,42 @@ export default function App() {
   };
 
   useEffect(() => {
-    if (!currentUser) return;
+    if (!sessionUser) return;
+
+    // Initial pull.
     syncData(true);
-    const interval = setInterval(() => {
-      syncData(true);
-    }, 25000);
-    return () => clearInterval(interval);
-  }, [currentUser]);
+
+    // Realtime: subscribe to postgres_changes on the 5 tables. Any event triggers
+    // a debounced re-sync — much cheaper than re-fetching everything per change.
+    const supabase = getSupabase();
+    let resyncTimer: ReturnType<typeof setTimeout> | null = null;
+    const debouncedResync = () => {
+      if (resyncTimer) clearTimeout(resyncTimer);
+      resyncTimer = setTimeout(() => syncData(true), 400);
+    };
+
+    let channel: ReturnType<NonNullable<typeof supabase>["channel"]> | null = null;
+    if (supabase) {
+      channel = supabase
+        .channel("copabolao-changes")
+        .on("postgres_changes", { event: "*", schema: "public", table: "copabolao_predictions" }, debouncedResync)
+        .on("postgres_changes", { event: "*", schema: "public", table: "copabolao_comments" }, debouncedResync)
+        .on("postgres_changes", { event: "*", schema: "public", table: "copabolao_groups" }, debouncedResync)
+        .on("postgres_changes", { event: "*", schema: "public", table: "copabolao_matches" }, debouncedResync)
+        .on("postgres_changes", { event: "*", schema: "public", table: "copabolao_users" }, debouncedResync)
+        .subscribe();
+    }
+
+    // Heartbeat fallback: catches missed events (network blips, sleeping tab waking up).
+    // 60s instead of the previous 25s — Realtime carries the live load now.
+    const heartbeat = setInterval(() => syncData(true), 60_000);
+
+    return () => {
+      if (resyncTimer) clearTimeout(resyncTimer);
+      clearInterval(heartbeat);
+      if (channel && supabase) supabase.removeChannel(channel);
+    };
+  }, [sessionUser]);
 
   // Invite & Sharing States
   const [pendingInviteCode, setPendingInviteCode] = useState<string | null>(() => {
@@ -358,6 +431,45 @@ export default function App() {
   const isAdmin = !!(sessionUser?.isAdmin);
 
   const [isSimulatorOpen, setIsSimulatorOpen] = useState(false);
+  const [isWelcomeJoining, setIsWelcomeJoining] = useState(false);
+
+  // Welcome modal: show on first login when the user has no group memberships yet,
+  // unless they already dismissed it (tracked per-user-per-browser via localStorage).
+  const welcomeDismissedKey = sessionUser ? `copabolao_welcome_dismissed_${sessionUser.id}` : '';
+  const userGroupCount = sessionUser
+    ? groups.filter((g) => g.members?.includes(sessionUser.id)).length
+    : 0;
+  const welcomeAlreadyDismissed =
+    !!welcomeDismissedKey && localStorage.getItem(welcomeDismissedKey) === '1';
+  const showWelcomeModal =
+    !!sessionUser && isFirstSyncDone && userGroupCount === 0 && !welcomeAlreadyDismissed;
+
+  const handleWelcomeAccept = async () => {
+    setIsWelcomeJoining(true);
+    try {
+      const success = await handleJoinGroup(DEFAULT_GROUP_CODE);
+      if (success) {
+        toast.success('Bem-vindo! Você entrou no bolão Geral Copa 2026.');
+        if (welcomeDismissedKey) localStorage.setItem(welcomeDismissedKey, '1');
+        setActiveTab('matches');
+      } else {
+        toast.error(
+          'Bolão público ainda não foi configurado. Avise o administrador (código: ' +
+            DEFAULT_GROUP_CODE + ').'
+        );
+        if (welcomeDismissedKey) localStorage.setItem(welcomeDismissedKey, '1');
+      }
+    } finally {
+      setIsWelcomeJoining(false);
+    }
+  };
+
+  const handleWelcomeDecline = () => {
+    if (welcomeDismissedKey) localStorage.setItem(welcomeDismissedKey, '1');
+    // Force a re-render by toggling a state — simplest is to flip isWelcomeJoining.
+    setIsWelcomeJoining((v) => !v);
+    setIsWelcomeJoining((v) => !v);
+  };
 
   const handleOpenCreateModal = (tab: 'create' | 'join' = 'create') => {
     setCreateModalInitialTab(tab);
@@ -366,8 +478,8 @@ export default function App() {
 
   // Sync state initially from database
   useEffect(() => {
-    fetch("/api/db/sync")
-      .then((res) => res.json())
+    if (!sessionUser) return;
+    apiJson<any>("/api/db/sync")
       .then((data) => {
         if (data.connected) {
           setDbStatusText("Nuvem Ativa ☁️");
@@ -386,13 +498,12 @@ export default function App() {
         setDbStatusText("Offline ⚠️");
         console.error("Falha de sincronização com Supabase:", err);
       });
-  }, [useRealFootball]);
+  }, [useRealFootball, sessionUser]);
 
   // Fetch real football fixtures
   useEffect(() => {
     setRealFootballLoading(true);
-    fetch("/api/football/fixtures")
-      .then((res) => res.json())
+    apiJson<any>("/api/football/fixtures")
       .then((data) => {
         setRealFootballLoading(false);
         if (data.useRealData && data.fixtures && data.fixtures.length > 0) {
@@ -496,71 +607,6 @@ export default function App() {
       localStorage.setItem('copabolao_comments_read_timestamps', JSON.stringify(next));
       return next;
     });
-
-    // Find match for context
-    const match = matches.find((m) => m.id === matchId);
-    if (!match) return;
-
-    // Find prediction context
-    const userPred = predictions.find((p) => p.matchId === matchId && p.userId === currentUser.id);
-    const userPredictionStr = userPred ? `${userPred.homeScore} - ${userPred.awayScore}` : "";
-
-    // List other group members to act as bot responder
-    const otherMembers = users.filter((u) => u.id !== currentUser.id);
-
-    // Call server-side Gemini API (Option B)
-    fetch("/api/ai/comment", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        homeTeam: match.homeTeam.name,
-        awayTeam: match.awayTeam.name,
-        userComment: text,
-        userName: currentUser.name,
-        userPrediction: userPredictionStr,
-        otherMembers,
-      }),
-    })
-      .then((res) => res.json())
-      .then((data) => {
-        const botComment: Comment = {
-          id: `c_bot_${Date.now()}`,
-          matchId,
-          userId: data.author.id,
-          userName: data.author.name,
-          userAvatar: data.author.avatar,
-          text: data.comment,
-          timestamp: new Date().toISOString(),
-          reactions: [{ emoji: "⚡", count: 1, users: [currentUser.id] }],
-        };
-        setComments((prev) => [...prev, botComment]);
-        saveCommentToDb(botComment); // Save bot comment too
-      })
-      .catch((err) => {
-        console.error("AI comment API error, falling back to simulated:", err);
-        setTimeout(() => {
-          const responseTexts = [
-            "Rapaz, que palpite ousado! Eu apostei no empate em?! 🤔",
-            "Estou achando que vai ser jogo duro, mas seu bolão está bem cotado!",
-            "Vixi, se der esse placar eu subo pro primeiro lugar haha! 🚀🔥",
-            "Gooool! Acabei de atualizar aqui. O clássico vai ferver!",
-            "Concordo plenamente com o comentário de cima. Esse jogo promete!",
-          ];
-          const randomMember = otherMembers[Math.floor(Math.random() * otherMembers.length)] || INITIAL_USERS[1];
-          const botComment: Comment = {
-            id: `c_bot_${Date.now() + 1}`,
-            matchId,
-            userId: randomMember.id,
-            userName: randomMember.name,
-            userAvatar: randomMember.avatar,
-            text: responseTexts[Math.floor(Math.random() * responseTexts.length)],
-            timestamp: new Date().toISOString(),
-            reactions: [{ emoji: "👍", count: 1, users: [currentUser.id] }],
-          };
-          setComments((prev) => [...prev, botComment]);
-          saveCommentToDb(botComment); // Save visual trace response too
-        }, 1500);
-      });
   };
 
   const handleToggleReaction = (commentId: string, emoji: string) => {
@@ -667,31 +713,48 @@ export default function App() {
     setActiveTab('matches'); // open matches instantly for predictions
   };
 
-  const handleJoinGroup = (code: string): boolean => {
+  const handleJoinGroup = async (code: string): Promise<boolean> => {
     const cleanCode = code.trim().toUpperCase();
-    const matched = groups.find((g) => g.code.trim().toUpperCase() === cleanCode);
-    if (!matched) return false;
 
-    // Check if progress contains user
-    if (matched.members.includes(currentUser.id)) return false;
-
-    const updatedGroup = {
-      ...matched,
-      members: [...matched.members, currentUser.id],
-    };
-
-    setGroups((prev) =>
-      prev.map((g) => {
-        if (g.id === matched.id) {
-          return updatedGroup;
-        }
-        return g;
-      })
-    );
-
-    saveGroupToDb(updatedGroup); // Sync updated members parameters to cloud
-    setActiveGroupId(matched.id);
-    return true;
+    // Server-side join (validates membership uniqueness, returns the canonical group row).
+    try {
+      const data = await apiJson<{ success?: boolean; group?: any; message?: string }>(
+        "/api/groups/join",
+        { method: "POST", body: JSON.stringify({ code: cleanCode }) }
+      );
+      if (data.success && data.group) {
+        const updatedGroup: Group = {
+          id: data.group.id,
+          name: data.group.name,
+          description: data.group.description,
+          league: data.group.league,
+          entryFee: Number(data.group.entry_fee || 0),
+          creatorId: data.group.creator_id,
+          code: data.group.code,
+          members: data.group.members || [],
+          isPrivate: data.group.is_private === true,
+        };
+        setGroups((prev) => {
+          const exists = prev.find((g) => g.id === updatedGroup.id);
+          if (exists) return prev.map((g) => (g.id === updatedGroup.id ? updatedGroup : g));
+          return [...prev, updatedGroup];
+        });
+        setActiveGroupId(updatedGroup.id);
+        return true;
+      }
+      return false;
+    } catch (e: any) {
+      // Fallback to local-state join if server is unreachable.
+      console.warn("Join via server falhou, tentando local:", e?.message);
+      const matched = groups.find((g) => g.code.trim().toUpperCase() === cleanCode);
+      if (!matched) return false;
+      if (matched.members.includes(currentUser.id)) return false;
+      const updatedGroup = { ...matched, members: [...matched.members, currentUser.id] };
+      setGroups((prev) => prev.map((g) => (g.id === matched.id ? updatedGroup : g)));
+      saveGroupToDb(updatedGroup);
+      setActiveGroupId(matched.id);
+      return true;
+    }
   };
 
   // --- Real-time Simulator Callbacks ---
@@ -707,6 +770,11 @@ export default function App() {
             scorers,
           };
           saveMatchToDb(updatedMatch); // Sync to Supabase
+          // Score predictions server-side (admin-only endpoint).
+          apiFetch("/api/predictions/score", {
+            method: "POST",
+            body: JSON.stringify({ matchId }),
+          }).catch((e) => console.error("Falha ao calcular pontos:", e));
           return updatedMatch;
         }
         return m;
@@ -732,86 +800,94 @@ export default function App() {
     );
   };
 
-  const handleResetSimulator = () => {
-    // Sync-reset state of Supabase database in cloud
-    fetch("/api/db/reset", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" }
-    })
-    .then((res) => res.json())
-    .then((data) => {
+  const handleResetSimulator = async () => {
+    // Calls the admin-only /api/db/reset endpoint, which now ONLY resets matches +
+    // wipes predictions. Groups, comments, and users are preserved so we don't blow
+    // away other people's data in shared environments.
+    try {
+      const data = await apiJson<{ success?: boolean; matches?: Match[]; message?: string }>(
+        "/api/db/reset",
+        {
+          method: "POST",
+          body: JSON.stringify({}),
+        }
+      );
       if (data.success && data.matches) {
         setMatches(data.matches);
+        setPredictions([]); // matches the server-side wipe
+        toast.success("Partidas resetadas. Seus bolões foram preservados.");
       } else {
-        setMatches(INITIAL_MATCHES);
+        toast.error(data.message || "Não foi possível resetar as partidas.");
       }
-    })
-    .catch((err) => {
-      console.error("Falha ao resetar banco do Supabase:", err);
-      setMatches(INITIAL_MATCHES);
-    });
-
-    setGroups(INITIAL_GROUPS);
-    setPredictions([]); // Reset predictions to allow fresh guess testing
-    setComments(INITIAL_COMMENTS);
-    setUsers(INITIAL_USERS);
-    setSessionUser(INITIAL_USERS[0]);
-    setActiveGroupId('g1');
-    setActiveTab('groups');
-    localStorage.removeItem('copabolao_groups');
-    localStorage.removeItem('copabolao_matches');
-    localStorage.removeItem('copabolao_predictions');
-    localStorage.removeItem('copabolao_comments');
-    localStorage.removeItem('copabolao_users_list');
-    localStorage.removeItem('copabolao_session_user');
+    } catch (e: any) {
+      console.error("Falha ao resetar simulador:", e);
+      toast.error("Falha de rede ao resetar.");
+    }
+    // After the reset, re-sync to refresh state from the source of truth.
+    syncData(true);
   };
 
-  if (!sessionUser) {
-    return (
-      <AuthScreen
-        onLoginSuccess={(name, userId, avatarUrl) => {
-          const registeredUser: User = {
-            id: userId,
-            name,
-            avatar: avatarUrl,
-            email: userId,
-          };
+  // --- Bootstrap session from Supabase + /api/auth/me ---
+  // The Supabase client persists session in localStorage; on mount we read it,
+  // then ask the server who we are (so isAdmin is set authoritatively from ADMIN_EMAILS).
+  useEffect(() => {
+    const supabase = getSupabase();
 
-          // Update users list in state with the newly authenticated user
+    const refreshFromServer = async () => {
+      try {
+        const me = await apiJson<{ user: User | null }>("/api/auth/me");
+        if (me?.user) {
+          setSessionUser(me.user);
+          // Mirror in users list for leaderboard rendering
           setUsers((prev) => {
-            const existsIdx = prev.findIndex(u => u.id === userId);
-            if (existsIdx >= 0) {
-              const copy = [...prev];
-              copy[existsIdx] = registeredUser;
-              localStorage.setItem('copabolao_users_list', JSON.stringify(copy));
-              return copy;
-            } else {
-              const list = [...prev, registeredUser];
-              localStorage.setItem('copabolao_users_list', JSON.stringify(list));
-              return list;
+            const exists = prev.find((u) => u.id === me.user!.id);
+            if (exists) {
+              const next = prev.map((u) => (u.id === me.user!.id ? me.user! : u));
+              localStorage.setItem('copabolao_users_list', JSON.stringify(next));
+              return next;
             }
+            const next = [...prev, me.user!];
+            localStorage.setItem('copabolao_users_list', JSON.stringify(next));
+            return next;
           });
+          // Note: we no longer silently auto-join the default group on login.
+          // Instead, WelcomeModal offers the user an explicit opt-in below.
+        } else {
+          setSessionUser(null);
+        }
+      } catch (e: any) {
+        // 401 = no session yet; anything else is a server error we just log.
+        if (e?.status !== 401) console.error("Falha ao buscar /api/auth/me:", e);
+        setSessionUser(null);
+      } finally {
+        setAuthChecked(true);
+      }
+    };
 
-          // Set active session user
-          setSessionUser(registeredUser);
-          localStorage.setItem('copabolao_session_user', JSON.stringify(registeredUser));
+    refreshFromServer();
 
-          // Auto-join the default general group 'g1' if they are not already a member! This is extremely helpful.
-          setGroups((prev) => {
-            const updated = prev.map((g) => {
-              if (g.id === 'g1' && !g.members.includes(userId)) {
-                const updatedGroup = { ...g, members: [...g.members, userId] };
-                saveGroupToDb(updatedGroup);
-                return updatedGroup;
-              }
-              return g;
-            });
-            localStorage.setItem('copabolao_groups', JSON.stringify(updated));
-            return updated;
-          });
-        }}
-      />
+    if (supabase) {
+      const { data: subscription } = supabase.auth.onAuthStateChange((_event, _session) => {
+        refreshFromServer();
+      });
+      return () => subscription.subscription.unsubscribe();
+    }
+  }, []);
+
+  if (!authChecked) {
+    // Brief splash while we figure out who is logged in
+    return (
+      <div className="min-h-screen bg-slate-950 text-slate-300 flex items-center justify-center">
+        <div className="flex items-center gap-2 text-sm font-semibold">
+          <RefreshCw className="w-4 h-4 animate-spin text-emerald-400" />
+          <span>Carregando sua conta...</span>
+        </div>
+      </div>
     );
+  }
+
+  if (!sessionUser) {
+    return <AuthScreen onLoginSuccess={() => { /* onAuthStateChange will refresh sessionUser */ }} />;
   }
 
   return (
@@ -833,8 +909,16 @@ export default function App() {
           error: {
             iconTheme: { primary: '#ef4444', secondary: '#0f172a' },
           }
-        }} 
+        }}
       />
+
+      {showWelcomeModal && (
+        <WelcomeModal
+          onAccept={handleWelcomeAccept}
+          onDecline={handleWelcomeDecline}
+          isLoading={isWelcomeJoining}
+        />
+      )}
 
       {/* Top Banner & Header */}
       <header className="bg-slate-900 border-b border-slate-800 sticky top-0 z-40 shadow-md">
@@ -980,8 +1064,8 @@ export default function App() {
                 </div>
                 <div className="flex flex-col gap-1.5 shrink-0">
                   <button
-                    onClick={() => {
-                      const success = handleJoinGroup(pendingInviteCode);
+                    onClick={async () => {
+                      const success = await handleJoinGroup(pendingInviteCode);
                       if (success) {
                         toast.success(`Você entrou no bolão "${invitedGroup.name}"!`);
                       } else {
@@ -1010,7 +1094,7 @@ export default function App() {
         })()}
 
         {/* Selected Group Header Context Card if a group is open */}
-        {activeGroup && (activeTab === 'matches' || activeTab === 'ranking' || activeTab === 'groups') ? (
+        {activeGroup && (activeTab === 'matches' || activeTab === 'ranking') ? (
           <div className="mb-5 p-4 bg-slate-900 border border-slate-800 rounded-2xl relative shadow-md">
             <button
               onClick={() => {
@@ -1030,8 +1114,8 @@ export default function App() {
                     {activeGroup.league}
                   </span>
 
-                  {((activeGroup.creatorId && currentUser.id && activeGroup.creatorId.toLowerCase() === currentUser.id.toLowerCase()) || 
-                    (currentUser.id && currentUser.id.toLowerCase() === 'dartanhan.fett@gmail.com')) ? (
+                  {((activeGroup.creatorId && currentUser.id && activeGroup.creatorId.toLowerCase() === currentUser.id.toLowerCase()) ||
+                    isAdmin) ? (
                     <button
                       onClick={() => setShowGroupDeleteModal(true)}
                       className="inline-flex items-center gap-1.5 px-2.5 py-0.5 bg-rose-950/50 text-rose-450 hover:bg-rose-900/60 hover:text-rose-100 rounded text-[9px] font-bold border border-rose-900/45 transition shadow-sm cursor-pointer"
@@ -1114,23 +1198,9 @@ export default function App() {
               </a>
             </div>
 
-            {/* Quick Internal Nav for open group if on groups tab */}
-            {activeTab === 'groups' && (
-              <div className="mt-4 pt-3 border-t border-slate-800/60 flex gap-2">
-                <button
-                  onClick={() => setActiveTab('matches')}
-                  className="flex-1 py-1 px-3 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs rounded-lg transition-transform active:scale-95 text-center block"
-                >
-                  Lançar Palpites ⚽️
-                </button>
-                <button
-                  onClick={() => setActiveTab('ranking')}
-                  className="flex-1 py-1 px-3 bg-slate-800 hover:bg-slate-750 text-slate-200 font-bold text-xs rounded-lg border border-slate-700 transition"
-                >
-                  Ver Ranking 🏆
-                </button>
-              </div>
-            )}
+            {/* Sub-tab quick nav was here — only made sense when this card showed on the
+                groups tab. Now the card only renders on matches/ranking, so this block
+                would never trigger. Removed to keep the layout simple. */}
           </div>
         ) : (
           (activeTab === 'matches' || activeTab === 'ranking') && (
@@ -1208,9 +1278,9 @@ export default function App() {
 
                   saveUserToDb(updatedUser); // Securely propagate changes to cloud
                 }}
-                onLogout={() => {
+                onLogout={async () => {
+                  await getSupabase()?.auth.signOut();
                   setSessionUser(null);
-                  localStorage.removeItem('copabolao_session_user');
                 }}
                 onDeleteAccount={handleDeleteAccount}
                 predictions={predictions}

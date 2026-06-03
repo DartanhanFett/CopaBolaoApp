@@ -3,6 +3,7 @@ import { Users, Plus, Star, Award, TrendingUp, Sparkles, Copy, Check, Share2, Co
 import { Group, User } from '../types';
 import { motion } from 'motion/react';
 import { toast } from 'react-hot-toast';
+import { DEFAULT_GROUP } from '../data/constants';
 
 interface GroupListProps {
   groups: Group[];
@@ -11,7 +12,7 @@ interface GroupListProps {
   onSelectGroup: (groupId: string) => void;
   onOpenCreateModal: (initialTab?: 'create' | 'join') => void;
   onDeleteGroup?: (groupId: string) => void;
-  onJoinGroup?: (code: string) => boolean;
+  onJoinGroup?: (code: string) => Promise<boolean> | boolean;
 }
 
 export default function GroupList({
@@ -37,10 +38,16 @@ export default function GroupList({
   // 1. My Groups: those where current user is a member
   const joinedGroups = groups.filter((g) => g.members.includes(currentUserId));
 
-  // 2. Public Explore Groups: groups that are public and current user is NOT a member
-  const publicExploreGroups = groups.filter(
-    (g) => !g.members.includes(currentUserId) && g.isPrivate !== true
-  );
+  // 2. Public Explore Groups: groups that are public and current user is NOT a member.
+  // The official default group is always pinned first when present, so newcomers find it
+  // without scrolling through community-created public bolões.
+  const publicExploreGroups = groups
+    .filter((g) => !g.members.includes(currentUserId) && g.isPrivate !== true)
+    .sort((a, b) => {
+      if (a.id === DEFAULT_GROUP.id) return -1;
+      if (b.id === DEFAULT_GROUP.id) return 1;
+      return 0;
+    });
 
   return (
     <div className="space-y-6">
@@ -276,6 +283,7 @@ export default function GroupList({
               <div className="grid grid-cols-1 gap-4">
                 {publicExploreGroups.map((group, index) => {
                   const groupMembers = users.filter((u) => group.members.includes(u.id));
+                  const isOfficial = group.id === DEFAULT_GROUP.id;
 
                   return (
                     <motion.div
@@ -283,14 +291,26 @@ export default function GroupList({
                       initial={{ opacity: 0, y: 15 }}
                       animate={{ opacity: 1, y: 0 }}
                       transition={{ delay: index * 0.05 }}
-                      className="p-4 bg-slate-900 border border-slate-800 rounded-2xl hover:border-slate-700 transition duration-200 relative flex flex-col justify-between"
+                      className={`p-4 rounded-2xl transition duration-200 relative flex flex-col justify-between ${
+                        isOfficial
+                          ? 'bg-gradient-to-br from-emerald-950/60 to-slate-900 border-2 border-emerald-500/40 hover:border-emerald-500/60 shadow-lg shadow-emerald-950/10'
+                          : 'bg-slate-900 border border-slate-800 hover:border-slate-700'
+                      }`}
                     >
                       <div>
                         {/* Top line info */}
                         <div className="flex items-center justify-between mb-2">
-                          <span className="px-2 py-0.5 bg-slate-850 rounded text-[10px] font-bold text-emerald-400 border border-slate-700/50">
-                            {group.league}
-                          </span>
+                          <div className="flex items-center gap-1.5">
+                            <span className="px-2 py-0.5 bg-slate-850 rounded text-[10px] font-bold text-emerald-400 border border-slate-700/50">
+                              {group.league}
+                            </span>
+                            {isOfficial && (
+                              <span className="px-2 py-0.5 bg-emerald-500/20 text-emerald-300 rounded text-[10px] font-extrabold border border-emerald-500/30 flex items-center gap-1">
+                                <Sparkles className="w-2.5 h-2.5" />
+                                Oficial
+                              </span>
+                            )}
+                          </div>
                           <span className="text-[10px] font-mono text-slate-500">
                             Cod: {group.code}
                           </span>
@@ -322,9 +342,9 @@ export default function GroupList({
 
                         {/* Direct Participate button */}
                         <button
-                          onClick={() => {
+                          onClick={async () => {
                             if (onJoinGroup) {
-                              const success = onJoinGroup(group.code);
+                              const success = await onJoinGroup(group.code);
                               if (success) {
                                 toast.success("Você entrou no bolão com sucesso!");
                               } else {

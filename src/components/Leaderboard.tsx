@@ -202,7 +202,7 @@ export default function Leaderboard({
                    <div>
                      <div className="flex items-center gap-1.5">
                        <span className={`text-sm font-bold ${isCurrentUser ? 'text-emerald-400' : 'text-slate-100'}`}>
-                         {isCurrentUser ? 'Você (Lucas)' : item.user.name}
+                         {item.user.name}
                        </span>
                        {isCurrentUser && (
                          <span className="text-[9px] bg-emerald-500/20 text-emerald-300 font-bold px-1.5 py-0.2 rounded">Meu</span>

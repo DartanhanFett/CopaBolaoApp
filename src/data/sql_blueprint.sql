@@ -19,9 +19,10 @@ CREATE TABLE IF NOT EXISTS copabolao_groups (
     description TEXT,
     league TEXT NOT NULL,
     entry_fee NUMERIC DEFAULT 0 NOT NULL,
-    creator_id TEXT REFERENCES copabolao_users(id) ON DELETE CASCADE,
+    creator_id TEXT REFERENCES copabolao_users(id) ON DELETE SET NULL,
     code TEXT UNIQUE NOT NULL,
     members JSONB DEFAULT '[]'::jsonb NOT NULL,
+    is_private BOOLEAN DEFAULT false NOT NULL,
     deleted BOOLEAN DEFAULT false NOT NULL,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL
 );
@@ -213,10 +214,46 @@ CREATE POLICY "Autor ou admin deleta comentario"
   USING (user_id = auth.uid()::text);
 
 -- ==========================================
+-- HABILITAR REALTIME (publicação de mudanças via WebSocket)
+-- ==========================================
+-- Necessário para o app receber updates em tempo real (sem polling).
+-- Se já tiver feito antes, o ALTER falha gracefully (DO NOTHING).
+ALTER PUBLICATION supabase_realtime ADD TABLE copabolao_users;
+ALTER PUBLICATION supabase_realtime ADD TABLE copabolao_groups;
+ALTER PUBLICATION supabase_realtime ADD TABLE copabolao_matches;
+ALTER PUBLICATION supabase_realtime ADD TABLE copabolao_predictions;
+ALTER PUBLICATION supabase_realtime ADD TABLE copabolao_comments;
+
+-- ==========================================
+-- SEED DO BOLÃO GERAL PÚBLICO ("Geral Copa 2026")
+-- ==========================================
+-- Esse grupo é oferecido a todo novo usuário no primeiro login (modal de boas-vindas).
+-- Rode UMA VEZ depois do schema acima. Substitua o creator_id por um email de admin
+-- já cadastrado em copabolao_users (ou deixe NULL se quiser anônimo).
+INSERT INTO copabolao_groups (id, name, description, league, entry_fee, creator_id, code, members, is_private, deleted)
+VALUES (
+  'g_default_copa2026',
+  'Geral Copa 2026',
+  'Bolão público oficial — aberto a qualquer um. Boa sorte e que vença o melhor palpiteiro! ⚽',
+  'Copa do Mundo 2026',
+  0,
+  NULL,
+  'COPA2026',
+  '[]'::jsonb,
+  false,
+  false
+)
+ON CONFLICT (id) DO NOTHING;
+
+-- ==========================================
 -- SCRIPT DE MIGRAÇÃO PARA QUEM JÁ TEM O BANCO ATIVO:
 -- Execute os comandos abaixo no SQL Editor do Supabase se você já possuía tabelas criadas:
--- 
+--
 -- ALTER TABLE copabolao_users ADD COLUMN IF NOT EXISTS deleted BOOLEAN DEFAULT false NOT NULL;
 -- ALTER TABLE copabolao_groups ADD COLUMN IF NOT EXISTS deleted BOOLEAN DEFAULT false NOT NULL;
+-- ALTER TABLE copabolao_groups ADD COLUMN IF NOT EXISTS is_private BOOLEAN DEFAULT false NOT NULL;
 -- ALTER TABLE copabolao_predictions ADD COLUMN IF NOT EXISTS group_id TEXT;
+-- ALTER TABLE copabolao_groups DROP CONSTRAINT IF EXISTS copabolao_groups_creator_id_fkey;
+-- ALTER TABLE copabolao_groups ADD CONSTRAINT copabolao_groups_creator_id_fkey
+--   FOREIGN KEY (creator_id) REFERENCES copabolao_users(id) ON DELETE SET NULL;
 -- ==========================================

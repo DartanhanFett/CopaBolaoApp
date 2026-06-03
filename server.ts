@@ -7,26 +7,16 @@ import { createClient } from "@supabase/supabase-js";
 import { z } from "zod";
 import helmet from "helmet";
 import cors from "cors";
+import rateLimit from "express-rate-limit";
 import { INITIAL_USERS, INITIAL_MATCHES, INITIAL_GROUPS, INITIAL_COMMENTS } from "./src/data/initialData";
+import { calculatePredictionPoints } from "./src/utils/rules";
+import { DEFAULT_GROUP } from "./src/data/constants";
 
 dotenv.config();
 
 // ─── Zod Validation Schemas ─────────────────────────────────────────────────
 
 const footballFixturesQuerySchema = z.object({}).optional();
-
-const aiCommentBodySchema = z.object({
-  homeTeam: z.string().min(1),
-  awayTeam: z.string().min(1),
-  userComment: z.string().min(1),
-  userName: z.string().min(1),
-  userPrediction: z.string().optional(),
-  otherMembers: z.array(z.object({
-    id: z.string(),
-    name: z.string(),
-    avatar: z.string(),
-  })).optional(),
-});
 
 const aiSuggestScoreBodySchema = z.object({
   homeTeam: z.string().min(1),
@@ -96,6 +86,7 @@ const dbGroupsUpsertBodySchema = z.object({
   creatorId: z.string().min(1),
   code: z.string().min(1),
   members: z.array(z.string()),
+  isPrivate: z.boolean().optional(),
 });
 
 const dbCommentsUpsertBodySchema = z.object({
@@ -202,6 +193,53 @@ function isAdminEmail(email: string): boolean {
   return adminEmails.includes(normalized) || hasAdminOverride;
 }
 
+/**
+ * Idempotently ensures the public default group exists in copabolao_groups.
+ * Called on first auth/me of any session — cheap (one-row select), so safe to run often.
+ * If the row was wiped (manual cleanup, migration, accidental delete), this recreates it
+ * without touching any other group's data.
+ */
+async function ensureDefaultGroup(supabase: any): Promise<void> {
+  if (!supabase) return;
+  try {
+    const { data: existing } = await supabase
+      .from("copabolao_groups")
+      .select("id, deleted")
+      .eq("id", DEFAULT_GROUP.id)
+      .maybeSingle();
+
+    if (existing && existing.deleted !== true) return; // already healthy
+
+    if (existing && existing.deleted === true) {
+      // Resurrect a soft-deleted default group rather than create a new id.
+      await supabase
+        .from("copabolao_groups")
+        .update({ deleted: false })
+        .eq("id", DEFAULT_GROUP.id);
+      return;
+    }
+
+    // Doesn't exist — create it. Anyone authenticated can later join via the welcome modal
+    // or the explore tab. creator_id is null (no human owner) and members starts empty.
+    await supabase.from("copabolao_groups").insert({
+      id: DEFAULT_GROUP.id,
+      name: DEFAULT_GROUP.name,
+      description: DEFAULT_GROUP.description,
+      league: DEFAULT_GROUP.league,
+      entry_fee: 0,
+      creator_id: null,
+      code: DEFAULT_GROUP.code,
+      members: [],
+      is_private: false,
+      deleted: false,
+    });
+  } catch (err) {
+    // Non-fatal — if this fails, the user can still use the app, just won't see the
+    // welcome offer. Worth logging so we notice if it's chronic.
+    logError("ensure-default-group", err);
+  }
+}
+
 // ─── Sync Mutex ────────────────────────────────────────────────────────────
 
 /**
@@ -251,17 +289,45 @@ async function startServer() {
   }));
 
   app.use(express.json({ limit: "1mb" }));
-  const PORT = 3000;
+
+  // --- Rate limiters ---
+  // Auth endpoints are abuse magnets (OTP spam, credential stuffing). Tight ceilings per IP.
+  // standardHeaders 'draft-7' exposes RateLimit-* headers so clients can self-throttle.
+  const authLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 min
+    limit: 20,                 // 20 auth requests per IP per window
+    standardHeaders: "draft-7",
+    legacyHeaders: false,
+    message: { success: false, message: "Muitas tentativas de autenticação. Aguarde alguns minutos." },
+  });
+  app.use("/api/auth/", authLimiter);
+
+  // The scoring endpoint hits Supabase hard (full-table scan + bulk upsert). Cap to avoid
+  // a runaway script triggering Supabase rate limits and locking out real traffic.
+  const scoreLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    limit: 10,
+    standardHeaders: "draft-7",
+    legacyHeaders: false,
+    message: { success: false, message: "Muitas requisições de pontuação. Aguarde 1 minuto." },
+  });
+  app.use("/api/predictions/score", scoreLimiter);
+
+  const PORT = Number(process.env.PORT) || 3000;
 
   // --- Sync Mutex Instance ---
   const syncMutex = new SyncMutex();
 
-  // Supabase Client: Lazy initialization to prevent app crash if environment credentials are missing
+  // Supabase Client: Lazy initialization to prevent app crash if environment credentials are missing.
+  // Prefer SERVICE_ROLE so the server can bypass RLS for legitimate operations on behalf of an
+  // already-authenticated user (the bearer token is validated separately in authenticateRequest).
+  // Falls back to anon if no service role is set — most reads still work, writes that need RLS
+  // bypass will fail silently. Add SUPABASE_SERVICE_ROLE_KEY to .env to fix that.
   let supabaseInstance: any = null;
   function getSupabaseClient() {
     if (!supabaseInstance) {
       const url = process.env.SUPABASE_URL;
-      const key = process.env.SUPABASE_ANON_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY;
+      const key = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY;
       if (url && key) {
         supabaseInstance = createClient(url, key);
       }
@@ -269,23 +335,101 @@ async function startServer() {
     return supabaseInstance;
   }
 
-  // Gemini Client: Lazy initialization to prevent app crash if environment key is missing
+  // Gemini Client: Lazy initialization. Returns null if GEMINI_API_KEY is missing
+  // so the AI suggestion endpoint falls back to canned random scores instead of crashing.
   let aiInstance: GoogleGenAI | null = null;
   function getGeminiClient() {
     if (!aiInstance) {
       const key = process.env.GEMINI_API_KEY;
       if (!key) return null;
-      aiInstance = new GoogleGenAI({
-        apiKey: key,
-        httpOptions: {
-          headers: {
-            "User-Agent": "aistudio-build",
-          },
-        },
-      });
+      aiInstance = new GoogleGenAI({ apiKey: key });
     }
     return aiInstance;
   }
+
+  // REST API: Suggest score and prediction with AI using Gemini.
+  // Public endpoint (no auth required) — it doesn't read user data, just returns a score guess.
+  app.post("/api/ai/suggest-score", async (req, res) => {
+    const parsed = aiSuggestScoreBodySchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ error: "Dados inválidos. Informe homeTeam e awayTeam." });
+    }
+
+    const { homeTeam, awayTeam } = parsed.data;
+
+    const ai = getGeminiClient();
+    if (!ai) {
+      // Fallback: random score + canned reasoning. Lets the feature work even without a Gemini key.
+      const randomHome = Math.floor(Math.random() * 4);
+      const randomAway = Math.floor(Math.random() * 4);
+      const fallbacks = [
+        `Clássico equilibrado! ${homeTeam} e ${awayTeam} vão se estudar. Empate disputado ou vitória magra.`,
+        `${homeTeam} vem ofensivo, ${awayTeam} sabe jogar fechado. Jogo de transições rápidas.`,
+        `Jogo travado no meio-campo. Decisão na bola parada ou contra-ataque.`,
+        `Confronto de zebra possível! ${awayTeam} pode surpreender se entrar ligado.`,
+      ];
+      return res.json({
+        homeScore: randomHome,
+        awayScore: randomAway,
+        reasoning: fallbacks[Math.floor(Math.random() * fallbacks.length)],
+        isAiGenerated: false,
+      });
+    }
+
+    try {
+      const prompt = `Analise de forma divertida o confronto de futebol entre "${homeTeam}" e "${awayTeam}" no contexto da Copa do Mundo 2026.
+Você é um palpiteiro raiz, zoeiro, sincero e bem-humorado do futebol brasileiro.
+
+REGRAS PARA OS PLACARES (DIVERSIDADE):
+- NÃO sugira sempre 2x1 ou 1x1. Varie bastante.
+- Empates malucos (2x2, 3x3), goleadas, zebras (derrotas surpresa), 0x0 — tudo cabe.
+- Use sua intuição de torcedor.
+
+Instruções para o "reasoning":
+1. Use gírias da resenha brasileira (ex: "entregou a paçoca", "chocolate com dancinha", "retranca", "pé-frio", "iludido", "lei do ex", "sentou no patê").
+2. Máximo 18 palavras.
+3. Opinativo e direto.
+
+Responda APENAS o JSON.`;
+
+      const modelName = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+      const response = await ai.models.generateContent({
+        model: modelName,
+        contents: prompt,
+        config: {
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              homeScore: { type: Type.INTEGER, description: "Gols do mandante" },
+              awayScore: { type: Type.INTEGER, description: "Gols do visitante" },
+              reasoning: { type: Type.STRING, description: "Comentário curto e divertido" },
+            },
+            required: ["homeScore", "awayScore", "reasoning"],
+          },
+        },
+      });
+
+      const responseText = response.text || "{}";
+      const parsedAi = JSON.parse(responseText.trim());
+
+      return res.json({
+        homeScore: typeof parsedAi.homeScore === "number" ? parsedAi.homeScore : 1,
+        awayScore: typeof parsedAi.awayScore === "number" ? parsedAi.awayScore : 0,
+        reasoning: parsedAi.reasoning || "Futebol é caixinha de surpresa!",
+        isAiGenerated: true,
+      });
+    } catch (e: any) {
+      logError("ai-suggest-score", e);
+      return res.json({
+        homeScore: 1,
+        awayScore: 1,
+        reasoning: "Jogo travado, aposto num 1x1 de segurança.",
+        isAiGenerated: false,
+      });
+    }
+  });
+
 
   // REST API: Get Real-Time Match Data (API-Football integration proxy)
   app.get("/api/football/fixtures", async (req, res) => {
@@ -380,172 +524,6 @@ async function startServer() {
     }
   });
 
-  // REST API: Intelligent banter comments generator using Gemini (Option B)
-  app.post("/api/ai/comment", async (req, res) => {
-    const parsed = aiCommentBodySchema.safeParse(req.body);
-    if (!parsed.success) {
-      return res.status(400).json({ error: "Dados inválidos para geração de comentário." });
-    }
-
-    const { homeTeam, awayTeam, userComment, userName, userPrediction, otherMembers } = parsed.data;
-
-    const randomMember = otherMembers && otherMembers.length > 0
-      ? otherMembers[Math.floor(Math.random() * otherMembers.length)]
-      : { id: "u2", name: "Guilherme", avatar: "https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?auto=format&fit=crop&w=150&q=80" };
-
-    const ai = getGeminiClient();
-    if (!ai) {
-      const fallbacks = [
-        "Rapaz, que palpite ousado! Eu apostei no empate em?! 🤔",
-        "Estou achando que vai ser jogo duro, mas seu bolão está bem cotado!",
-        "Vixi, se der esse placar eu subo pro primeiro lugar haha! 🚀🔥",
-        "Concordo plenamente com o comentário de cima. Esse jogo promete!",
-        "Duvido muito hein! Mas vamos ver no final do jogo!",
-      ];
-      return res.json({
-        comment: fallbacks[Math.floor(Math.random() * fallbacks.length)],
-        author: randomMember,
-        isAiGenerated: false,
-      });
-    }
-
-    try {
-      const prompt = `Você é um participante zueiro, fanático por futebol e altamente corneteiro em um grupo de Whatsapp de bolão da Copa do Mundo chamado "${randomMember.name}".
-Seu amigo "${userName}" acabou de mandar um comentário/palpite sobre o jogo entre ${homeTeam} e ${awayTeam}.
-A mensagem de "${userName}" foi: "${userComment}".
-O palpite exato dele para esse jogo é: "${userPrediction || "Não palpitou ainda"}".
-
-Instruções para seu comentário de resposta rápida:
-1. Responda de forma extremamente natural, como se estivesse digitando rápido no Whatsapp deitado no sofá.
-2. Escreva prioritariamente em letras minúsculas, use abreviações normais de internet (ex: 'tb', 'vc', 'nd', 'q', 'ta', 'mto', 'kkkk'). No máximo uma exclamação ou interrogação.
-3. Use gírias reais e atuais do futebol brasileiro (ex: 'viajou legal', 'zicou', 'empolgou', 'na retranca', 'cheirinho', 'mala', 'pé frio', 'mitaço', 'pipocou', 'iludido').
-4. Não dê respostas compridas, genéricas nem formais! Se o palpite dele for absurdo, ironize rápido. Se for pé-frio, corneteie.
-5. Limite-se a no máximo 12 palavras.
-6. Responda APENAS com a mensagem de chat direta, sem aspas, preâmbulos ou explicações.
-
-Exemplos de tom esperado:
-- "kkkkk viajou demais, esse time não faz gol nem se o goleiro sair"
-- "nem ferrando, o ataque deles tá mto ruim de pontaria"
-- "zicou legal agora clã kkkkk se der esse placar eu pago a breja"
-- "boa mestre tb acho q o contra-ataque vai liquidar os caras hoje"`;
-
-      const modelName = process.env.GEMINI_MODEL || "gemini-3.5-flash";
-      const response = await ai.models.generateContent({
-        model: modelName,
-        contents: prompt,
-      });
-
-      const responseText = (response.text || "").replace(/"/g, "").trim();
-      return res.json({
-        comment: responseText || "Rapaz, concordo com você!",
-        author: randomMember,
-        isAiGenerated: true,
-      });
-    } catch (e: any) {
-      logError("ai-comment", e);
-      return res.json({
-        comment: "Olha lá hein! Jogo vai ser muito pegado!",
-        author: randomMember,
-        isAiGenerated: false,
-      });
-    }
-  });
-
-  // REST API: Suggest score and prediction with AI using Gemini
-  app.post("/api/ai/suggest-score", async (req, res) => {
-    const parsed = aiSuggestScoreBodySchema.safeParse(req.body);
-    if (!parsed.success) {
-      return res.status(400).json({ error: "Dados inválidos. Informe homeTeam e awayTeam." });
-    }
-
-    const { homeTeam, awayTeam } = parsed.data;
-
-    const ai = getGeminiClient();
-    if (!ai) {
-      const randomHome = Math.floor(Math.random() * 3);
-      const randomAway = Math.floor(Math.random() * 3);
-      const fallbacks = [
-        `Clássico equilibrado! ${homeTeam} e ${awayTeam} vão se estudar bastante. Acho que sai um empate disputado ou vitória magra do time que cometer menos erros.`,
-        `O time do ${homeTeam} vem de boa fase ofensiva, mas o ${awayTeam} sabe jogar bem fechadinho. Jogo de transições rápidas e forte marcação!`,
-        `Minha intuição de futebol diz que este confronto promete fortes emoções. Vejo uma leve vantagem tática para o ${homeTeam} neste momento.`,
-      ];
-      return res.json({
-        homeScore: randomHome,
-        awayScore: randomAway,
-        reasoning: fallbacks[Math.floor(Math.random() * fallbacks.length)],
-        isAiGenerated: false,
-      });
-    }
-
-    try {
-      const prompt = `Analise de forma divertida o confronto de futebol entre "${homeTeam}" e "${awayTeam}" de acordo com o clima da Copa do Mundo.
-Você é um palpiteiro raiz, fanfarrão, extremamente sincero, analítico e bem-humorado do futebol brasileiro. 
-
-REGRAS CRÍTICAS PARA OS PLACARES (DIVERSIDADE):
-- NÃO sugira sempre o mesmo placar! Varie bastante as suposições. Evite a mesmice de sempre sugerir 2x1 ou 1x1.
-- Sinta-se livre para prever empates malucos (ex: 2 a 2, 3 a 3), vitórias folgadas, derrotas surpreendentes (zebras históricas), ou jogos ultra defense (0 a 0).
-- Proponha placares criativos e variados de acordo com sua intuição de torcedor fanfarrão.
-
-Instruções para o comentário explicativo ('reasoning'):
-1. NÃO fale como um robô. Use expressões clássicas da resenha pós-jogo brasileira de forma super natural (ex: 'entregar a paçoca', 'chocolate com direito a dancinha', 'retranca pesada', 'jogo de compadres', 'lei do ex infalível', 'oxigênio extra', 'suco de futebol brasileiro').
-2. Seja super curto e divertido (máximo de 18 palavras).
-3. Seja opinativo, zueiro e direto ao ponto. Por exemplo, se antecipar uma zebra ou goleada, meta a boca ou celebre o futebol arte.
-
-Seu retorno DEVE seguir estritamente o formato JSON fornecido.
-Seu JSON de retorno DEVE conter estes campos exatos:
-{
-  "homeScore": número inteiro de gols para o time da casa (home team),
-  "awayScore": número inteiro de gols para o time visitante (away team),
-  "reasoning": "explicação curta, zueira e cheia de gíria da resenha de futebol brasileiro"
-}`;
-
-      const modelName = process.env.GEMINI_MODEL || "gemini-3.5-flash";
-      const response = await ai.models.generateContent({
-        model: modelName,
-        contents: prompt,
-        config: {
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              homeScore: {
-                type: Type.INTEGER,
-                description: "Placar sugerido para o time de casa (home team)",
-              },
-              awayScore: {
-                type: Type.INTEGER,
-                description: "Placar sugerido para o time visitante (away team)",
-              },
-              reasoning: {
-                type: Type.STRING,
-                description: "Breve comentário justificando o palpite de forma divertida e analítica",
-              },
-            },
-            required: ["homeScore", "awayScore", "reasoning"],
-          },
-        },
-      });
-
-      const responseText = response.text || "{}";
-      const parsed = JSON.parse(responseText.trim());
-
-      return res.json({
-        homeScore: typeof parsed.homeScore === "number" ? parsed.homeScore : 1,
-        awayScore: typeof parsed.awayScore === "number" ? parsed.awayScore : 0,
-        reasoning: parsed.reasoning || "Futebol é uma caixinha de surpresas!",
-        isAiGenerated: true,
-      });
-    } catch (e: any) {
-      logError("ai-suggest-score", e);
-      return res.json({
-        homeScore: 1,
-        awayScore: 1,
-        reasoning: "Esse jogo vai ser travado demais no meio de campo, aposto num 1 a 1 de segurança!",
-        isAiGenerated: false,
-      });
-    }
-  });
-
   // REST API: Sync database states with Supabase (race-condition protected via mutex)
   app.get("/api/db/sync", async (req, res) => {
     const supabase = getSupabaseClient();
@@ -599,6 +577,7 @@ Seu JSON de retorno DEVE conter estes campos exatos:
               creatorId: g.creator_id,
               code: g.code,
               members: g.members || [],
+              isPrivate: g.is_private === true,
             }));
           return res.json({ success: true, data: mappedGroups });
         }
@@ -644,8 +623,20 @@ Seu JSON de retorno DEVE conter estes campos exatos:
         });
       }
 
-      // Proactive Auto-Seeding if table is empty
+      // Proactive Auto-Seeding if table is empty (DEV ONLY — never seed a production DB).
       if (!users || users.length === 0) {
+        if (process.env.NODE_ENV === "production") {
+          return res.json({
+            connected: true,
+            seeded: false,
+            users: [],
+            groups: [],
+            predictions: [],
+            comments: [],
+            matches: null,
+          });
+        }
+
         console.log("Banco Supabase vazio! Iniciando Auto-Seeding para melhor experiência inicial...");
 
         await supabase.from("copabolao_users").insert(INITIAL_USERS);
@@ -722,6 +713,7 @@ Seu JSON de retorno DEVE conter estes campos exatos:
           creatorId: g.creator_id,
           code: g.code,
           members: g.members || [],
+          isPrivate: g.is_private === true,
         }));
 
       const mappedPredictions = (pRes.data || []).map((p: any) => ({
@@ -777,8 +769,11 @@ Seu JSON de retorno DEVE conter estes campos exatos:
     }
   });
 
-  // REST API: Reset database on Supabase with fresh dynamic match dates
-  // PROTECTED: Requires admin authentication via Bearer token + confirmation token
+  // REST API: Reset MATCHES ONLY back to the initial seed (admin-only).
+  // Important — this NEVER touches user-created groups, comments, or user accounts.
+  // The simulator's "Restaurar Estado Inicial" button is the only caller; its purpose
+  // is to put match scores/status back so admins can re-test the prediction flow.
+  // Predictions are also wiped (since they reference matches whose state is changing).
   app.post("/api/db/reset", async (req, res) => {
     const supabase = getSupabaseClient();
     if (!supabase) return res.json({ success: false, message: "Sem Supabase conectado." });
@@ -801,54 +796,22 @@ Seu JSON de retorno DEVE conter estes campos exatos:
       return res.status(403).json({ success: false, message: "Acesso negado. Apenas administradores podem resetar o banco de dados." });
     }
 
-    // --- CONFIRMATION TOKEN CHECK ---
-    const { confirmationToken } = parsed.data;
-    const expectedToken = process.env.RESET_CONFIRMATION_TOKEN;
-
-    if (expectedToken && confirmationToken !== expectedToken) {
-      return res.status(403).json({
-        success: false,
-        message: "Token de confirmação inválido. O reset requer um token de segurança adicional.",
-      });
-    }
+    // The reset is already gated by (1) Bearer JWT validation and (2) ADMIN_EMAILS check.
+    // We previously also required a RESET_CONFIRMATION_TOKEN, but that doesn't compose with
+    // a browser app — exposing the token to the client would defeat the purpose, and the
+    // simulator UI now has its own visible confirmation step. If you want curl-level
+    // protection back, re-add the token check here.
 
     // --- AUDIT LOG ---
-    console.warn(`[AUDIT] DATABASE RESET initiated by admin: ${authUser.email} at ${new Date().toISOString()}`);
+    console.warn(`[AUDIT] MATCHES RESET initiated by admin: ${authUser.email} at ${new Date().toISOString()}`);
 
     await syncMutex.acquire();
     try {
+      // Wipe predictions (they're tied to specific match states we're about to overwrite).
       await supabase.from("copabolao_predictions").delete().neq("id", "_");
 
-      await supabase.from("copabolao_comments").delete().neq("id", "_");
-      const mappedComments = INITIAL_COMMENTS.map((c) => ({
-        id: c.id,
-        match_id: c.matchId,
-        user_id: c.userId,
-        user_name: c.userName,
-        user_avatar: c.userAvatar,
-        text: c.text,
-        timestamp: c.timestamp,
-        reactions: c.reactions,
-      }));
-      if (mappedComments.length > 0) {
-        await supabase.from("copabolao_comments").insert(mappedComments);
-      }
-
-      await supabase.from("copabolao_groups").delete().neq("id", "_");
-      const mappedGroups = INITIAL_GROUPS.map((g) => ({
-        id: g.id,
-        name: g.name,
-        description: g.description,
-        league: g.league,
-        entry_fee: g.entryFee,
-        creator_id: g.creatorId,
-        code: g.code,
-        members: g.members,
-      }));
-      if (mappedGroups.length > 0) {
-        await supabase.from("copabolao_groups").insert(mappedGroups);
-      }
-
+      // Reset matches: replace the whole set with the initial seed.
+      // Groups, comments, users, and the public default group are NOT touched.
       await supabase.from("copabolao_matches").delete().neq("id", "_");
       const mappedMatches = INITIAL_MATCHES.map((m) => ({
         id: m.id,
@@ -1135,6 +1098,240 @@ Seu JSON de retorno DEVE conter estes campos exatos:
     }
   });
 
+  // ─── New canonical endpoints (auth, groups join, scoring) ─────────────
+
+  /**
+   * Returns the authenticated user enriched with isAdmin (computed from ADMIN_EMAILS).
+   * Used by the React app on mount/auth-change to populate sessionUser.
+   * Returns 401 if no valid bearer token is present.
+   */
+  app.get("/api/auth/me", async (req, res) => {
+    const supabase = getSupabaseClient();
+    if (!supabase) {
+      return res.status(401).json({ user: null, message: "Supabase não configurado." });
+    }
+
+    const authUser = await authenticateRequest(supabase, req.headers.authorization);
+    if (!authUser) {
+      return res.status(401).json({ user: null, message: "Não autenticado." });
+    }
+
+    // Make sure the public default group exists for any newcomer to join.
+    // Fire-and-forget: non-blocking and self-healing if it ever gets wiped.
+    ensureDefaultGroup(supabase);
+
+    try {
+      const { data: profile } = await supabase
+        .from("copabolao_users")
+        .select("*")
+        .eq("id", authUser.email)
+        .maybeSingle();
+
+      // Auto-create a stub profile on first login so the rest of the app has something to render.
+      let finalProfile = profile;
+      const fallbackName = authUser.email.split("@")[0] || "Palpiteiro";
+      const fallbackAvatar = `https://api.dicebear.com/7.x/adventurer/svg?seed=${encodeURIComponent(fallbackName)}`;
+
+      if (!profile || profile.deleted === true) {
+        if (!profile) {
+          const { data: inserted, error: insertErr } = await supabase
+            .from("copabolao_users")
+            .insert({ id: authUser.email, name: fallbackName, avatar: fallbackAvatar, deleted: false })
+            .select()
+            .single();
+          if (insertErr) {
+            // RLS blocked the insert (most common on free-tier without service_role key).
+            // Don't crash — return the synthesized profile so the user can at least enter the app.
+            // The next /api/db/users upsert from the client side will retry the persistence.
+            logError("auth-me-insert", insertErr);
+            finalProfile = { id: authUser.email, name: fallbackName, avatar: fallbackAvatar, deleted: false };
+          } else {
+            finalProfile = inserted || { id: authUser.email, name: fallbackName, avatar: fallbackAvatar, deleted: false };
+          }
+        } else {
+          // Reactivate a soft-deleted profile.
+          const { data: reactivated, error: reactivateErr } = await supabase
+            .from("copabolao_users")
+            .update({ deleted: false })
+            .eq("id", authUser.email)
+            .select()
+            .single();
+          if (reactivateErr) logError("auth-me-reactivate", reactivateErr);
+          finalProfile = reactivated || { ...profile, deleted: false };
+        }
+      }
+
+      // Final safety net: if anything above produced a null profile, synthesize one from the JWT.
+      if (!finalProfile) {
+        finalProfile = { id: authUser.email, name: fallbackName, avatar: fallbackAvatar, deleted: false };
+      }
+
+      return res.json({
+        user: {
+          id: finalProfile.id,
+          name: finalProfile.name,
+          avatar: finalProfile.avatar,
+          email: finalProfile.id,
+          isAdmin: isAdminEmail(authUser.email),
+        },
+      });
+    } catch (err) {
+      logError("auth-me", err);
+      return res.status(500).json({ user: null, message: "Erro ao buscar perfil." });
+    }
+  });
+
+  /**
+   * Centralized group-join endpoint.
+   * - Looks up the group by invite code (private groups are joinable as long as you have the code).
+   * - Appends the authenticated user to `members[]` and returns the canonical row.
+   */
+  const groupsJoinBodySchema = z.object({ code: z.string().min(1) });
+  app.post("/api/groups/join", async (req, res) => {
+    const parsed = groupsJoinBodySchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ success: false, message: "Código inválido." });
+    }
+    const supabase = getSupabaseClient();
+    if (!supabase) return res.json({ success: false, message: "Sem Supabase" });
+
+    const authUser = await authenticateRequest(supabase, req.headers.authorization);
+    if (!authUser) {
+      return res.status(401).json({ success: false, message: "Autenticação necessária." });
+    }
+
+    const cleanCode = parsed.data.code.trim().toUpperCase();
+    try {
+      const { data: group, error } = await supabase
+        .from("copabolao_groups")
+        .select("*")
+        .eq("code", cleanCode)
+        .maybeSingle();
+      if (error) {
+        logError("groups-join-fetch", error);
+        return res.json({ success: false, message: "Erro ao buscar bolão." });
+      }
+      if (!group || group.deleted === true) {
+        return res.status(404).json({ success: false, message: "Bolão não encontrado para esse código." });
+      }
+
+      const members: string[] = Array.isArray(group.members) ? group.members : [];
+      if (members.includes(authUser.email)) {
+        return res.json({ success: true, group, alreadyMember: true });
+      }
+      const updatedMembers = [...members, authUser.email];
+
+      const { data: updated, error: updateErr } = await supabase
+        .from("copabolao_groups")
+        .update({ members: updatedMembers })
+        .eq("id", group.id)
+        .select()
+        .single();
+      if (updateErr) {
+        logError("groups-join-update", updateErr);
+        return res.json({ success: false, message: "Erro ao atualizar membros." });
+      }
+
+      return res.json({ success: true, group: updated });
+    } catch (err) {
+      logError("groups-join", err);
+      return res.json({ success: false, message: "Erro ao processar entrada no bolão." });
+    }
+  });
+
+  /**
+   * Admin-only: Recalculates and persists `points_earned` for every prediction of a finished match.
+   * Triggered by the simulator when a match flips to "completed".
+   */
+  const scoreMatchBodySchema = z.object({ matchId: z.string().min(1) });
+  app.post("/api/predictions/score", async (req, res) => {
+    const parsed = scoreMatchBodySchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ success: false, message: "matchId obrigatório." });
+    }
+    const supabase = getSupabaseClient();
+    if (!supabase) return res.json({ success: false, message: "Sem Supabase" });
+
+    const authUser = await authenticateRequest(supabase, req.headers.authorization);
+    if (!authUser) {
+      return res.status(401).json({ success: false, message: "Autenticação necessária." });
+    }
+    if (!isAdminEmail(authUser.email)) {
+      return res.status(403).json({ success: false, message: "Apenas administradores podem calcular pontuação." });
+    }
+
+    const { matchId } = parsed.data;
+    try {
+      const { data: matchRow, error: matchErr } = await supabase
+        .from("copabolao_matches")
+        .select("*")
+        .eq("id", matchId)
+        .maybeSingle();
+      if (matchErr || !matchRow) {
+        return res.status(404).json({ success: false, message: "Partida não encontrada." });
+      }
+      if (matchRow.status !== "completed") {
+        return res.status(400).json({ success: false, message: "Partida ainda não finalizada." });
+      }
+
+      const match = {
+        id: matchRow.id,
+        homeTeam: matchRow.home_team,
+        awayTeam: matchRow.away_team,
+        date: matchRow.date,
+        status: matchRow.status as "completed",
+        homeScore: matchRow.home_score !== null ? Number(matchRow.home_score) : undefined,
+        awayScore: matchRow.away_score !== null ? Number(matchRow.away_score) : undefined,
+        scorers: matchRow.scorers || [],
+        league: matchRow.league,
+      };
+
+      const { data: predRows, error: predErr } = await supabase
+        .from("copabolao_predictions")
+        .select("*")
+        .eq("match_id", matchId);
+      if (predErr) {
+        logError("score-fetch", predErr);
+        return res.json({ success: false, message: "Erro ao buscar palpites." });
+      }
+
+      const updates = (predRows || []).map((p: any) => {
+        const points = calculatePredictionPoints(
+          {
+            id: p.id,
+            userId: p.user_id,
+            matchId: p.match_id,
+            homeScore: Number(p.home_score),
+            awayScore: Number(p.away_score),
+          },
+          match
+        );
+        return {
+          id: p.id,
+          user_id: p.user_id,
+          match_id: p.match_id,
+          home_score: Number(p.home_score),
+          away_score: Number(p.away_score),
+          points_earned: points,
+          group_id: p.group_id || null,
+        };
+      });
+
+      if (updates.length > 0) {
+        const { error: upsertErr } = await supabase.from("copabolao_predictions").upsert(updates);
+        if (upsertErr) {
+          logError("score-upsert", upsertErr);
+          return res.json({ success: false, message: "Erro ao salvar pontuação." });
+        }
+      }
+
+      return res.json({ success: true, scored: updates.length });
+    } catch (err) {
+      logError("predictions-score", err);
+      return res.json({ success: false, message: "Erro ao calcular pontuação." });
+    }
+  });
+
   // ─── DB Operations (all protected by auth + Zod validation) ────────────
 
   // REST API: Upsert user to Supabase
@@ -1189,6 +1386,39 @@ Seu JSON de retorno DEVE conter estes campos exatos:
     }
 
     const { id, userId, matchId, homeScore, awayScore, pointsEarned, groupId } = parsed.data;
+
+    // --- Bet-lock enforcement (server-side; complements client-side isMatchLocked) ---
+    // Non-admins cannot palpitar after the match has started or within 15 minutes of kickoff.
+    if (!isAdminEmail(authUser.email)) {
+      try {
+        const { data: match } = await supabase
+          .from("copabolao_matches")
+          .select("status,date")
+          .eq("id", matchId)
+          .maybeSingle();
+
+        if (match) {
+          if (match.status !== "upcoming") {
+            return res.status(409).json({
+              success: false,
+              message: "Palpites bloqueados: a partida já começou ou foi finalizada.",
+            });
+          }
+          const kickoff = new Date(match.date).getTime();
+          if (Number.isFinite(kickoff) && Date.now() >= kickoff - 15 * 60 * 1000) {
+            return res.status(409).json({
+              success: false,
+              message: "Palpites bloqueados: faltam menos de 15 minutos para o início da partida.",
+            });
+          }
+        }
+        // If the match row is missing, we let the upsert proceed — it could be a custom match
+        // created client-side that hasn't been propagated yet.
+      } catch (lockErr) {
+        logError("predictions-betlock", lockErr);
+      }
+    }
+
     try {
       let { error } = await supabase.from("copabolao_predictions").upsert({
         id,
@@ -1240,7 +1470,7 @@ Seu JSON de retorno DEVE conter estes campos exatos:
       return res.status(403).json({ success: false, message: "Você só pode modificar seus próprios grupos." });
     }
 
-    const { id, name, description, league, entryFee, creatorId, code, members } = parsed.data;
+    const { id, name, description, league, entryFee, creatorId, code, members, isPrivate } = parsed.data;
     try {
       const { error } = await supabase.from("copabolao_groups").upsert({
         id,
@@ -1251,6 +1481,7 @@ Seu JSON de retorno DEVE conter estes campos exatos:
         creator_id: creatorId,
         code,
         members,
+        is_private: isPrivate ?? false,
       });
       if (error) logError("db-groups-upsert", error);
       return res.json({ success: !error });
@@ -1358,6 +1589,17 @@ Seu JSON de retorno DEVE conter estes campos exatos:
     }
 
     const { groupId, userId } = parsed.data;
+
+    // Admin can delete the public default group, but `ensureDefaultGroup` recreates it
+    // on the next /api/auth/me — useful to zero out memberships/palpites without permanently
+    // losing the entry-point bolão. Non-admins are blocked outright.
+    if (groupId === DEFAULT_GROUP.id && !isAdminEmail(authUser.email)) {
+      return res.status(403).json({
+        success: false,
+        message: "O bolão público oficial só pode ser deletado por um administrador.",
+      });
+    }
+
     try {
       const { data: group, error: fetchErr } = await supabase
         .from("copabolao_groups")

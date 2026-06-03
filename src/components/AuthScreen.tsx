@@ -1,9 +1,12 @@
 import React, { useState } from 'react';
 import { Mail, User, Sparkles, ArrowRight, Check, AlertCircle, ArrowLeft, KeyRound } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
+import { getSupabase } from '../../lib/supabase/client';
+import { apiJson } from '../lib/api';
+import PrivacyPolicy from './PrivacyPolicy';
 
 interface AuthScreenProps {
-  onLoginSuccess: (userName: string, userEmail: string, avatarUrl: string) => void;
+  onLoginSuccess: () => void; // Parent reads /api/auth/me and updates sessionUser
 }
 
 export default function AuthScreen({ onLoginSuccess }: AuthScreenProps) {
@@ -16,7 +19,8 @@ export default function AuthScreen({ onLoginSuccess }: AuthScreenProps) {
   const [isLoading, setIsLoading] = useState(false);
   const [errorMsg, setErrorMsg] = useState('');
   const [successMsg, setSuccessMsg] = useState('');
-  const [mockCodeHint, setMockCodeHint] = useState('');
+  const [hasSupabase] = useState<boolean>(() => !!getSupabase());
+  const [showPrivacy, setShowPrivacy] = useState(false);
 
   // Pre-calculated beautiful mock avatars to let users register and choose
   const mockAvatars = [
@@ -29,61 +33,62 @@ export default function AuthScreen({ onLoginSuccess }: AuthScreenProps) {
   ];
   const [selectedAvatar, setSelectedAvatar] = useState(mockAvatars[0]);
 
-  // Requesting the access OTP code
-  const handleRequestOtp = (e: React.FormEvent) => {
+  const handleRequestOtp = async (e: React.FormEvent) => {
     e.preventDefault();
     setErrorMsg('');
     setSuccessMsg('');
 
     const trimmedEmail = email.trim().toLowerCase();
-
     if (!trimmedEmail) {
       setErrorMsg('Por favor, informe seu endereço de e-mail!');
       return;
     }
-
     if (isSignUp && !name.trim()) {
       setErrorMsg('Adicione o seu nome ou apelido para o ranking!');
       return;
     }
 
     setIsLoading(true);
-
-    fetch('/api/auth/otp/send', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        email: trimmedEmail,
-        isSignUp,
-        name: name.trim()
-      })
-    })
-    .then(res => res.json())
-    .then(data => {
-      setIsLoading(false);
-      if (data.success) {
-        setSuccessMsg(data.message || 'Código enviado! Verifique seu e-mail.');
+    try {
+      const supabase = getSupabase();
+      if (!supabase) {
+        // Supabase not configured — fall back to legacy server-mediated OTP for local dev.
+        const data = await apiJson<{ success: boolean; message?: string; isMock?: boolean; mockCode?: string }>(
+          '/api/auth/otp/send',
+          { method: 'POST', body: JSON.stringify({ email: trimmedEmail, isSignUp, name: name.trim() }) }
+        );
+        if (!data.success) throw new Error(data.message || 'Erro ao enviar código.');
+        setSuccessMsg(data.message || 'Modo simulação ativo: use 123456');
         setStep('otp');
-        if (data.isMock && data.mockCode) {
-          setMockCodeHint(data.mockCode);
-        } else {
-          setMockCodeHint('');
-        }
-      } else {
-        setErrorMsg(data.message || 'Erro ao enviar código. Verifique as informações.');
+        return;
       }
-    })
-    .catch(err => {
+
+      // Real Supabase OTP — token arrives by email.
+      // emailRedirectTo points the magic link back to the current page so it works
+      // even if the user clicks the link instead of typing the 6-digit code.
+      const { error } = await supabase.auth.signInWithOtp({
+        email: trimmedEmail,
+        options: {
+          shouldCreateUser: isSignUp,
+          emailRedirectTo: window.location.origin,
+        },
+      });
+      if (error) {
+        const friendly = error.message?.toLowerCase().includes('rate')
+          ? 'Muitos pedidos seguidos. Aguarde um minuto e tente de novo.'
+          : 'Erro ao enviar o código de acesso. Tente novamente.';
+        throw new Error(friendly);
+      }
+      setSuccessMsg('Código enviado! Verifique seu e-mail (e a pasta de spam).');
+      setStep('otp');
+    } catch (err: any) {
+      setErrorMsg(err.message || 'Erro de conexão ao solicitar OTP.');
+    } finally {
       setIsLoading(false);
-      setErrorMsg('Erro de conexão ao solicitar OTP.');
-      console.error(err);
-    });
+    }
   };
 
-  // Verifying the OTP code
-  const handleVerifyOtp = (e: React.FormEvent) => {
+  const handleVerifyOtp = async (e: React.FormEvent) => {
     e.preventDefault();
     setErrorMsg('');
     setSuccessMsg('');
@@ -94,86 +99,71 @@ export default function AuthScreen({ onLoginSuccess }: AuthScreenProps) {
     }
 
     setIsLoading(true);
+    try {
+      const supabase = getSupabase();
+      const trimmedEmail = email.trim().toLowerCase();
 
-    fetch('/api/auth/otp/verify', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        email: email.trim().toLowerCase(),
-        token: otpToken.trim(),
-        isSignUp,
-        name: name.trim(),
-        avatar: selectedAvatar
-      })
-    })
-    .then(res => res.json())
-    .then(data => {
-      setIsLoading(false);
-      if (data.success) {
+      if (!supabase) {
+        // Legacy fallback (no Supabase env vars).
+        const data = await apiJson<{ success: boolean; message?: string }>(
+          '/api/auth/otp/verify',
+          {
+            method: 'POST',
+            body: JSON.stringify({
+              email: trimmedEmail,
+              token: otpToken.trim(),
+              isSignUp,
+              name: name.trim(),
+              avatar: selectedAvatar,
+            }),
+          }
+        );
+        if (!data.success) throw new Error(data.message || 'Código incorreto.');
         setSuccessMsg('Autenticado com sucesso! Entrando no bolão...');
-        setTimeout(() => {
-          onLoginSuccess(data.user.name, data.user.id, data.user.avatar);
-        }, 1200);
-      } else {
-        setErrorMsg(data.message || 'Código incorreto ou expirado da verificação.');
+        setTimeout(() => onLoginSuccess(), 800);
+        return;
       }
-    })
-    .catch(err => {
-      setIsLoading(false);
-      setErrorMsg('Erro de conexão ao verificar código.');
-      console.error(err);
-    });
-  };
 
-  const handleProviderLogin = (provider: 'Google' | 'Apple') => {
-    setErrorMsg('');
-    setIsLoading(true);
-    
-    const mockEmail = provider === 'Google' ? 'dartanhan.fett@gmail.com' : 'lucas.apple@example.com';
-    const mockName = provider === 'Google' ? 'Dartanhan Fett' : 'Lucas Cupertino';
-    const mockPic = provider === 'Google' 
-      ? 'https://api.dicebear.com/7.x/adventurer/svg?seed=Dartanhan'
-      : 'https://api.dicebear.com/7.x/adventurer/svg?seed=Dusty';
+      // Real Supabase verify. Either type works; "email" covers both signup and login flows in Supabase.
+      const { data: verifyData, error } = await supabase.auth.verifyOtp({
+        email: trimmedEmail,
+        token: otpToken.trim(),
+        type: 'email',
+      });
+      if (error || !verifyData.session) {
+        throw new Error('Código incorreto ou expirado. Solicite um novo código.');
+      }
 
-    fetch('/api/auth/register', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email: mockEmail, name: mockName, avatar: mockPic })
-    })
-    .then(res => res.json())
-    .then(data => {
-      if (!data.success) {
-        return fetch('/api/auth/login', {
+      // Upsert profile row (server reads the JWT we just received).
+      try {
+        await apiJson('/api/db/users', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ email: mockEmail })
-        }).then(r => r.json());
+          body: JSON.stringify({
+            id: trimmedEmail,
+            name: name.trim() || trimmedEmail.split('@')[0],
+            avatar: selectedAvatar,
+          }),
+        });
+      } catch (profileErr: any) {
+        // Don't block login if profile upsert fails — /api/auth/me will create on demand.
+        console.warn('Profile upsert failed (continuing):', profileErr?.message);
       }
-      return data;
-    })
-    .then(data => {
+
+      setSuccessMsg('Autenticado com sucesso! Entrando no bolão...');
+      setTimeout(() => onLoginSuccess(), 800);
+    } catch (err: any) {
+      setErrorMsg(err.message || 'Erro ao verificar código de acesso.');
+    } finally {
       setIsLoading(false);
-      if (data.success) {
-        setSuccessMsg(`Conectado com sucesso via ${provider}!`);
-        setTimeout(() => {
-          onLoginSuccess(data.user.name, data.user.id, data.user.avatar);
-        }, 1000);
-      } else {
-        setErrorMsg('Erro na autenticação social rápida.');
-      }
-    })
-    .catch(() => {
-      setIsLoading(false);
-      setErrorMsg('Erro ao tentar conectar via login social.');
-    });
+    }
   };
 
   return (
+    <>
+    {showPrivacy && <PrivacyPolicy onClose={() => setShowPrivacy(false)} />}
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col justify-center px-4 py-8" id="auth-screen">
       <div className="w-full max-w-md mx-auto space-y-6" id="auth-container">
-        
+
         {/* Branding Title */}
         <div className="text-center space-y-2" id="auth-header">
           <motion.div
@@ -203,7 +193,6 @@ export default function AuthScreen({ onLoginSuccess }: AuthScreenProps) {
           className="bg-slate-900 border border-slate-800/85 rounded-2xl p-6 shadow-2xl relative overflow-hidden"
           id="auth-card"
         >
-          {/* Back glows */}
           <div className="absolute top-0 right-0 -mr-12 -mt-12 w-28 h-28 bg-emerald-500/5 rounded-full blur-2xl pointer-events-none" />
 
           {step === 'form' ? (
@@ -212,28 +201,16 @@ export default function AuthScreen({ onLoginSuccess }: AuthScreenProps) {
               <div className="flex bg-slate-950 rounded-xl p-1 mb-6 border border-slate-850" id="auth-tabs">
                 <button
                   type="button"
-                  onClick={() => {
-                    setIsSignUp(false);
-                    setErrorMsg('');
-                    setSuccessMsg('');
-                  }}
-                  className={`flex-1 py-2 text-xs font-bold rounded-lg transition ${
-                    !isSignUp ? 'bg-slate-800 text-emerald-400' : 'text-slate-400 hover:text-slate-200'
-                  }`}
+                  onClick={() => { setIsSignUp(false); setErrorMsg(''); setSuccessMsg(''); }}
+                  className={`flex-1 py-2 text-xs font-bold rounded-lg transition ${!isSignUp ? 'bg-slate-800 text-emerald-400' : 'text-slate-400 hover:text-slate-200'}`}
                   id="tab-login"
                 >
                   Entrar
                 </button>
                 <button
                   type="button"
-                  onClick={() => {
-                    setIsSignUp(true);
-                    setErrorMsg('');
-                    setSuccessMsg('');
-                  }}
-                  className={`flex-1 py-2 text-xs font-bold rounded-lg transition ${
-                    isSignUp ? 'bg-slate-800 text-emerald-400' : 'text-slate-400 hover:text-slate-200'
-                  }`}
+                  onClick={() => { setIsSignUp(true); setErrorMsg(''); setSuccessMsg(''); }}
+                  className={`flex-1 py-2 text-xs font-bold rounded-lg transition ${isSignUp ? 'bg-slate-800 text-emerald-400' : 'text-slate-400 hover:text-slate-200'}`}
                   id="tab-signup"
                 >
                   Criar Conta
@@ -241,7 +218,6 @@ export default function AuthScreen({ onLoginSuccess }: AuthScreenProps) {
               </div>
 
               <form onSubmit={handleRequestOtp} className="space-y-4" id="form-request-otp">
-                {/* Display Name for sign up */}
                 <AnimatePresence mode="popLayout">
                   {isSignUp && (
                     <motion.div
@@ -269,7 +245,6 @@ export default function AuthScreen({ onLoginSuccess }: AuthScreenProps) {
                   )}
                 </AnimatePresence>
 
-                {/* Email input */}
                 <div className="space-y-1.5" id="form-email-field">
                   <label className="block text-xs font-semibold text-slate-400">
                     Endereço de E-mail *
@@ -288,7 +263,6 @@ export default function AuthScreen({ onLoginSuccess }: AuthScreenProps) {
                   </div>
                 </div>
 
-                {/* Avatar picker (Only on Sign Up for cool game-like personality!) */}
                 {isSignUp && (
                   <div className="space-y-2 pt-1" id="form-avatar-picker">
                     <label className="block text-xs font-semibold text-slate-400">
@@ -300,9 +274,7 @@ export default function AuthScreen({ onLoginSuccess }: AuthScreenProps) {
                           key={url}
                           type="button"
                           onClick={() => setSelectedAvatar(url)}
-                          className={`relative rounded-full block transition-transform active:scale-95 ${
-                            selectedAvatar === url ? 'ring-2 ring-emerald-400' : 'opacity-70 hover:opacity-100'
-                          }`}
+                          className={`relative rounded-full block transition-transform active:scale-95 ${selectedAvatar === url ? 'ring-2 ring-emerald-400' : 'opacity-70 hover:opacity-100'}`}
                         >
                           <img src={url} alt="avatar" className="w-8 h-8 rounded-full object-cover" referrerPolicy="no-referrer" />
                           {selectedAvatar === url && (
@@ -316,7 +288,6 @@ export default function AuthScreen({ onLoginSuccess }: AuthScreenProps) {
                   </div>
                 )}
 
-                {/* Status alerts */}
                 {errorMsg && (
                   <div className="p-3 bg-rose-500/10 border border-rose-500/30 rounded-lg text-xs font-semibold text-rose-400 flex items-center gap-2" id="alert-error">
                     <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />
@@ -331,7 +302,6 @@ export default function AuthScreen({ onLoginSuccess }: AuthScreenProps) {
                   </div>
                 )}
 
-                {/* Submit to send OTP */}
                 <button
                   type="submit"
                   disabled={isLoading}
@@ -350,17 +320,12 @@ export default function AuthScreen({ onLoginSuccess }: AuthScreenProps) {
               </form>
             </div>
           ) : (
-            // STEP: OTP Code Verification UI
             <div id="auth-step-verify">
               <div className="space-y-4">
                 <div className="flex items-center gap-2 text-xs text-slate-400 font-semibold mb-2">
                   <button
                     type="button"
-                    onClick={() => {
-                      setStep('form');
-                      setErrorMsg('');
-                      setSuccessMsg('');
-                    }}
+                    onClick={() => { setStep('form'); setErrorMsg(''); setSuccessMsg(''); }}
                     className="flex items-center gap-1 text-slate-400 hover:text-emerald-400 transition"
                     id="btn-back-form"
                   >
@@ -398,19 +363,18 @@ export default function AuthScreen({ onLoginSuccess }: AuthScreenProps) {
                     />
                   </div>
 
-                  {/* Simulator Testing badge dynamically fetched */}
-                  {mockCodeHint && (
-                    <div className="bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 rounded-xl p-3 text-xs flex flex-col gap-1 text-center" id="mock-badge">
-                      <span className="font-bold">🧪 Ambiente de Teste Ativo</span>
+                  {!hasSupabase && (
+                    <div className="bg-amber-500/10 border border-amber-500/20 text-amber-400 rounded-xl p-3 text-xs flex flex-col gap-1 text-center" id="mock-badge">
+                      <span className="font-bold">🧪 Modo simulação (sem Supabase configurado)</span>
                       <p className="text-[10.5px] opacity-80">
-                        Como o Supabase não está totalmente provisionado, use o código de simulação:
+                        Configure VITE_SUPABASE_URL/VITE_SUPABASE_ANON_KEY no .env para OTP real. Por enquanto use:
                       </p>
                       <button
                         type="button"
-                        onClick={() => setOtpToken(mockCodeHint)}
-                        className="mt-1 bg-emerald-500 text-slate-950 py-1 px-2 rounded-lg font-mono font-bold hover:bg-emerald-400 active:scale-95 transition"
+                        onClick={() => setOtpToken('123456')}
+                        className="mt-1 bg-amber-500 text-slate-950 py-1 px-2 rounded-lg font-mono font-bold hover:bg-amber-400 active:scale-95 transition"
                       >
-                        Autopreencher {mockCodeHint}
+                        Autopreencher 123456
                       </button>
                     </div>
                   )}
@@ -449,48 +413,38 @@ export default function AuthScreen({ onLoginSuccess }: AuthScreenProps) {
             </div>
           )}
 
-          {/* Social Logins divider */}
+          {/* Social login placeholder — disabled until real OAuth is wired up. */}
           <div className="my-5 flex items-center justify-between text-xs text-slate-500">
             <span className="border-b border-slate-800 w-1/4"></span>
-            <span>ou continue com</span>
+            <span>login social em breve</span>
             <span className="border-b border-slate-800 w-1/4"></span>
           </div>
-
-          {/* Providers Group */}
-          <div className="grid grid-cols-2 gap-3" id="auth-social-logins">
-            {/* Google */}
-            <button
-              onClick={() => handleProviderLogin('Google')}
-              className="py-2 px-3 bg-slate-950 hover:bg-slate-850 text-slate-350 hover:text-white border border-slate-800 rounded-xl text-xs font-bold transition active:scale-95 flex items-center justify-center gap-2"
-              id="btn-google"
-            >
-              <svg className="w-4 h-4 fill-current shrink-0" viewBox="0 0 24 24">
-                <path d="M12.24 10.285V13.4h6.887C18.2 15.614 15.645 18 12.24 18c-3.86 0-7-3.14-7-7s3.14-7 7-7c1.7 0 3.3.6 4.6 1.8l2.4-2.4C17.3 1.7 14.9 1 12.24 1c-5.5 0-10 4.5-10 10s4.5 10 10 10c5.5 0 10-4.5 10-10 0-.6-.1-1.2-.2-1.715H12.24z"/>
-              </svg>
+          <div className="grid grid-cols-2 gap-3 opacity-50 pointer-events-none" id="auth-social-placeholder">
+            <div className="py-2 px-3 bg-slate-950 text-slate-500 border border-slate-800 rounded-xl text-xs font-bold flex items-center justify-center gap-2">
               <span>Google</span>
-            </button>
-
-            {/* Apple ID */}
-            <button
-              onClick={() => handleProviderLogin('Apple')}
-              className="py-2 px-3 bg-slate-950 hover:bg-slate-850 text-slate-350 hover:text-white border border-slate-800 rounded-xl text-xs font-bold transition active:scale-95 flex items-center justify-center gap-2"
-              id="btn-apple"
-            >
-              <svg className="w-4 h-4 fill-current shrink-0" viewBox="0 0 24 24">
-                <path d="M18.71 19.5c-.83 1.24-1.71 2.45-3.05 2.47-1.34.03-1.77-.79-3.29-.79-1.53 0-2 .77-3.27.82-1.31.05-2.3-1.32-3.14-2.53C4.25 17 2.94 12.45 4.7 9.39c.87-1.52 2.43-2.48 4.12-2.51 1.28-.02 2.5.87 3.29.87.78 0 2.26-1.07 3.81-.91.65.03 2.47.26 3.64 1.98-.09.06-2.17 1.28-2.15 3.81.03 3.02 2.65 4.03 2.68 4.04-.03.07-.42 1.44-1.38 2.83M15.97 4.17c.66-.81 1.11-1.93.99-3.06-1 .04-2.2.67-2.92 1.5-.61.73-1.14 1.87-1 2.99 1.1.08 2.25-.59 2.93-1.43z"/>
-              </svg>
+            </div>
+            <div className="py-2 px-3 bg-slate-950 text-slate-500 border border-slate-800 rounded-xl text-xs font-bold flex items-center justify-center gap-2">
               <span>Apple ID</span>
-            </button>
+            </div>
           </div>
-
         </motion.div>
 
-        {/* Informative Footer */}
         <div className="text-center text-[10px] text-slate-600 space-y-1">
-          <p>Ao criar conta você aceita os termos de zoeira, palpites e responsabilidades esportivas.</p>
+          <p>
+            Ao criar conta você concorda com os{' '}
+            <button
+              type="button"
+              onClick={() => setShowPrivacy(true)}
+              className="text-emerald-400 hover:text-emerald-300 underline font-bold"
+            >
+              Termos & Privacidade
+            </button>
+            .
+          </p>
           <p className="font-semibold text-slate-500">Desenvolvido com carinho por Dartanhan & Amigos</p>
         </div>
       </div>
     </div>
+    </>
   );
 }

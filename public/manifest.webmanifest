@@ -1,0 +1,32 @@
+{
+  "name": "CopaBolão — Bolão de Futebol entre Amigos",
+  "short_name": "CopaBolão",
+  "description": "Crie grupos de bolão da Copa do Mundo, lance palpites e cornete a galera no chat ao vivo.",
+  "start_url": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#020617",
+  "theme_color": "#10b981",
+  "lang": "pt-BR",
+  "categories": ["sports", "entertainment", "social"],
+  "icons": [
+    {
+      "src": "/icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/icons/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}

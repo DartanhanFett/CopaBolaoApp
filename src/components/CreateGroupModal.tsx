@@ -114,7 +114,7 @@ interface CreateGroupModalProps {
       date: string;
     }
   ) => void;
-  onJoinGroup: (code: string) => boolean; // returns true if success
+  onJoinGroup: (code: string) => Promise<boolean> | boolean; // returns true if success
   initialTab?: 'create' | 'join';
 }
 
@@ -225,41 +225,17 @@ export default function CreateGroupModal({
   const handleCreate = (e: React.FormEvent) => {
     e.preventDefault();
     if (!name.trim()) return;
-
-    if (league === 'Customizado') {
-      const hName = customHomeName.trim() || 'Mandante';
-      const hCode = (customHomeCode.trim() || hName.substring(0, 3)).toUpperCase();
-      const aName = customAwayName.trim() || 'Visitante';
-      const aCode = (customAwayCode.trim() || aName.substring(0, 3)).toUpperCase();
-      const finalLeagueName = `Custom: ${hName} x ${aName}`;
-
-      onCreateGroup(
-        name.trim(),
-        description.trim(),
-        finalLeagueName,
-        entryFee,
-        isPrivate,
-        {
-          homeName: hName,
-          homeCode: hCode,
-          awayName: aName,
-          awayCode: aCode,
-          date: customDate ? new Date(customDate).toISOString() : new Date().toISOString()
-        }
-      );
-    } else {
-      onCreateGroup(name.trim(), description.trim(), league, entryFee, isPrivate);
-    }
+    onCreateGroup(name.trim(), description.trim(), league, entryFee, isPrivate);
     onClose();
   };
 
-  const handleJoin = (e: React.FormEvent) => {
+  const handleJoin = async (e: React.FormEvent) => {
     e.preventDefault();
     setErrorMsg('');
     setSuccessMsg('');
     if (!joinCode.trim()) return;
 
-    const success = onJoinGroup(joinCode.trim().toUpperCase());
+    const success = await onJoinGroup(joinCode.trim().toUpperCase());
     if (success) {
       setSuccessMsg('Grupo adicionado com sucesso!');
       setTimeout(() => {
@@ -349,18 +325,13 @@ export default function CreateGroupModal({
               <div className="grid grid-cols-2 gap-3">
                 <div>
                   <label className="block text-xs font-semibold text-slate-400 mb-1.5">
-                    Selecione a Liga / Copa
+                    Liga / Copa
                   </label>
-                  <select
-                    value={league}
-                    onChange={(e) => setLeague(e.target.value)}
-                    className="w-full px-3.6 py-2 bg-slate-950 border border-slate-800 focus:border-emerald-500 rounded-lg text-sm text-slate-100 outline-none transition"
-                  >
-                    <option value="Copa do Mundo 2026">Copa do Mundo 2026</option>
-                    <option value="Champions League">Champions League</option>
-                    <option value="Brasileirão Série A">Brasileirão Série A</option>
-                    <option value="Customizado">Customizado (Adicionar Jogo)</option>
-                  </select>
+                  <div className="w-full px-3.6 py-2 bg-slate-950 border border-slate-800 rounded-lg text-sm text-slate-100 flex items-center gap-2">
+                    <span>🏆</span>
+                    <span className="font-semibold">Copa do Mundo 2026</span>
+                  </div>
+                  {/* O foco da v1 do app é a Copa do Mundo. Outros campeonatos chegam em versões futuras. */}
                 </div>
 
                 <div>
@@ -419,184 +390,7 @@ export default function CreateGroupModal({
                 </div>
               </div>
 
-              {league === 'Customizado' && (
-                <div
-                  className="p-3.5 bg-slate-950/60 border border-slate-800 rounded-xl space-y-4"
-                >
-                  <span className="text-xs font-bold text-emerald-400 flex items-center gap-1.5 uppercase tracking-wider">
-                    ⚽ Configurar Partida Única do Bolão
-                  </span>
-                  
-                  {/* Home Team Section */}
-                  <div className="relative">
-                    <label className="block text-[10px] font-semibold text-slate-400 mb-1 flex justify-between items-center">
-                      <span>Time Mandante *</span>
-                      {!isHomeCodeManual && customHomeName.trim() && (
-                        <span className="text-[9px] text-emerald-400 font-mono">
-                          Sigla automática: {customHomeCode}
-                        </span>
-                      )}
-                    </label>
-                    <div className="relative">
-                      <span className="absolute left-2.5 top-2.5 text-slate-500">
-                        <Search className="w-3.5 h-3.5" />
-                      </span>
-                      <input
-                        type="text"
-                        required
-                        placeholder="Pesquise ou digite o Time Mandante... (Ex: Flamengo)"
-                        value={customHomeName}
-                        onChange={(e) => handleHomeNameChange(e.target.value)}
-                        onBlur={() => {
-                          // Allow click on suggestion before closing
-                          setTimeout(() => setShowHomeSuggestions(false), 200);
-                        }}
-                        onFocus={() => {
-                          if (customHomeName.trim().length > 0 && homeSuggestions.length > 0) {
-                            setShowHomeSuggestions(true);
-                          }
-                        }}
-                        className="w-full pl-8 pr-3 py-1.5 bg-slate-900 border border-slate-850 focus:border-emerald-500 rounded-lg text-xs text-slate-100 outline-none"
-                      />
-                    </div>
-                    
-                    {/* Home Suggestions Dropdown */}
-                    {showHomeSuggestions && homeSuggestions.length > 0 && (
-                      <div className="absolute z-50 left-0 right-0 mt-1 max-h-40 overflow-y-auto bg-slate-850 border border-slate-750 rounded-lg shadow-xl divide-y divide-slate-800 scrollbar-thin">
-                        {homeSuggestions.map((team) => (
-                          <button
-                            key={team.name}
-                            type="button"
-                            onMouseDown={() => selectHomeSuggestion(team)}
-                            className="w-full px-3 py-2 text-left text-xs hover:bg-slate-800 flex items-center justify-between text-slate-200 transition"
-                          >
-                            <span className="font-semibold">{team.name}</span>
-                            <span className="px-1.5 py-0.5 bg-slate-900 text-emerald-400 text-[10px] font-mono rounded border border-slate-800 font-bold">
-                              {team.code}
-                            </span>
-                          </button>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-
-                  {/* Away Team Section */}
-                  <div className="relative">
-                    <label className="block text-[10px] font-semibold text-slate-400 mb-1 flex justify-between items-center">
-                      <span>Time Visitante *</span>
-                      {!isAwayCodeManual && customAwayName.trim() && (
-                        <span className="text-[9px] text-emerald-400 font-mono">
-                          Sigla automática: {customAwayCode}
-                        </span>
-                      )}
-                    </label>
-                    <div className="relative">
-                      <span className="absolute left-2.5 top-2.5 text-slate-500">
-                        <Search className="w-3.5 h-3.5" />
-                      </span>
-                      <input
-                        type="text"
-                        required
-                        placeholder="Pesquise ou digite o Time Visitante... (Ex: Real Madrid)"
-                        value={customAwayName}
-                        onChange={(e) => handleAwayNameChange(e.target.value)}
-                        onBlur={() => {
-                          // Allow click on suggestion before closing
-                          setTimeout(() => setShowAwaySuggestions(false), 200);
-                        }}
-                        onFocus={() => {
-                          if (customAwayName.trim().length > 0 && awaySuggestions.length > 0) {
-                            setShowAwaySuggestions(true);
-                          }
-                        }}
-                        className="w-full pl-8 pr-3 py-1.5 bg-slate-900 border border-slate-850 focus:border-emerald-500 rounded-lg text-xs text-slate-100 outline-none"
-                      />
-                    </div>
-                    
-                    {/* Away Suggestions Dropdown */}
-                    {showAwaySuggestions && awaySuggestions.length > 0 && (
-                      <div className="absolute z-50 left-0 right-0 mt-1 max-h-40 overflow-y-auto bg-slate-850 border border-slate-750 rounded-lg shadow-xl divide-y divide-slate-800 scrollbar-thin">
-                        {awaySuggestions.map((team) => (
-                          <button
-                            key={team.name}
-                            type="button"
-                            onMouseDown={() => selectAwaySuggestion(team)}
-                            className="w-full px-3 py-2 text-left text-xs hover:bg-slate-800 flex items-center justify-between text-slate-200 transition"
-                          >
-                            <span className="font-semibold">{team.name}</span>
-                            <span className="px-1.5 py-0.5 bg-slate-900 text-emerald-400 text-[10px] font-mono rounded border border-slate-800 font-bold">
-                              {team.code}
-                            </span>
-                          </button>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-
-                  {/* Advanced Toggle for manual abbreviations override */}
-                  <div className="pt-1">
-                    <button
-                      type="button"
-                      onClick={() => setShowAdvancedCodes(!showAdvancedCodes)}
-                      className="text-[10px] text-slate-500 hover:text-emerald-400 flex items-center gap-1 font-bold underline cursor-pointer outline-none transition"
-                    >
-                      <Settings className="w-3 h-3" />
-                      {showAdvancedCodes ? 'Ocultar ajuste de siglas' : 'Personalizar siglas dos times'}
-                    </button>
-
-                    {showAdvancedCodes && (
-                      <div className="grid grid-cols-2 gap-2 mt-2 p-2 bg-slate-950 rounded-lg border border-slate-850">
-                        <div>
-                          <label className="block text-[9px] font-semibold text-slate-400 mb-1">
-                            Sigla Mandante:
-                          </label>
-                          <input
-                            type="text"
-                            maxLength={3}
-                            placeholder="Ex: RQA"
-                            value={customHomeCode}
-                            onChange={(e) => {
-                              setCustomHomeCode(e.target.value.toUpperCase());
-                              setIsHomeCodeManual(true);
-                            }}
-                            className="w-full px-2 py-1 bg-slate-900 border border-slate-800 rounded text-xs text-center font-mono focus:border-emerald-500 text-slate-100 outline-none"
-                          />
-                        </div>
-                        <div>
-                          <label className="block text-[9px] font-semibold text-slate-400 mb-1">
-                            Sigla Visitante:
-                          </label>
-                          <input
-                            type="text"
-                            maxLength={3}
-                            placeholder="Ex: UDF"
-                            value={customAwayCode}
-                            onChange={(e) => {
-                              setCustomAwayCode(e.target.value.toUpperCase());
-                              setIsAwayCodeManual(true);
-                            }}
-                            className="w-full px-2 py-1 bg-slate-900 border border-slate-800 rounded text-xs text-center font-mono focus:border-emerald-500 text-slate-100 outline-none"
-                          />
-                        </div>
-                      </div>
-                    )}
-                  </div>
-
-                  {/* Date Input */}
-                  <div>
-                    <label className="block text-[10px] font-semibold text-slate-400 mb-1">
-                      Data e Horário da Partida
-                    </label>
-                    <input
-                      type="datetime-local"
-                      required
-                      value={customDate}
-                      onChange={(e) => setCustomDate(e.target.value)}
-                      className="w-full px-2.5 py-1.5 bg-slate-900 border border-slate-850 focus:border-emerald-500 rounded-lg text-xs text-slate-100 outline-none"
-                    />
-                  </div>
-                </div>
-              )}
+              {league === 'Customizado' && null}
 
               <div className="pt-2">
                 <button

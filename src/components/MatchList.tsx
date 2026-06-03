@@ -4,6 +4,7 @@ import { Match, Prediction, User } from '../types';
 import { isMatchLocked } from '../utils/rules';
 import { motion, AnimatePresence } from 'motion/react';
 import TeamCrest from './TeamCrest';
+import { apiJson } from '../lib/api';
 
 interface MatchListProps {
   matches: Match[];
@@ -115,29 +116,26 @@ export default function MatchList({
     return edits.home !== pred.homeScore.toString() || edits.away !== pred.awayScore.toString();
   };
 
+  // Asks the server to suggest a placar via Gemini. Public endpoint, no auth required.
+  // Server falls back to a random score if GEMINI_API_KEY isn't configured.
   const handleAiSuggest = async (matchId: string, homeTeam: string, awayTeam: string) => {
-    setAiLoading(prev => ({ ...prev, [matchId]: true }));
+    setAiLoading((prev) => ({ ...prev, [matchId]: true }));
     try {
-      const response = await fetch("/api/ai/suggest-score", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ homeTeam, awayTeam })
-      });
-      const data = await response.json();
+      const data = await apiJson<{ homeScore?: number; awayScore?: number; reasoning?: string }>(
+        '/api/ai/suggest-score',
+        { method: 'POST', body: JSON.stringify({ homeTeam, awayTeam }) }
+      );
       if (data.homeScore !== undefined && data.awayScore !== undefined) {
-        setEditingScores(prev => ({
+        setEditingScores((prev) => ({
           ...prev,
-          [matchId]: { home: data.homeScore.toString(), away: data.awayScore.toString() }
+          [matchId]: { home: String(data.homeScore), away: String(data.awayScore) },
         }));
-        setAiAdvice(prev => ({
-          ...prev,
-          [matchId]: data.reasoning
-        }));
+        setAiAdvice((prev) => ({ ...prev, [matchId]: data.reasoning || '' }));
       }
     } catch (e) {
-      console.error("Erro ao solicitar sugestão de IA:", e);
+      console.error('Erro ao solicitar sugestão de IA:', e);
     } finally {
-      setAiLoading(prev => ({ ...prev, [matchId]: false }));
+      setAiLoading((prev) => ({ ...prev, [matchId]: false }));
     }
   };
 
@@ -425,17 +423,17 @@ export default function MatchList({
                       </div>
                     ) : (
                       <div className="flex items-center gap-2 self-end">
-                        {/* AI Suggest Score Sparkles Button */}
+                        {/* AI Suggest Score button — pre-fills the placar inputs with a Gemini guess */}
                         <button
                           onClick={() => handleAiSuggest(match.id, match.homeTeam.name, match.awayTeam.name)}
                           disabled={aiLoading[match.id]}
-                          title="Dica de Placar com Inteligência Artificial Gemini"
+                          title="Pedir sugestão de placar com IA"
                           className={`py-2 px-2.5 rounded-lg bg-teal-500/15 hover:bg-teal-500/25 disabled:bg-slate-800 disabled:text-slate-500 text-teal-400 hover:text-teal-300 font-bold text-xs flex items-center justify-center gap-1 border border-teal-500/25 transition active:scale-95 shrink-0 ${
                             aiLoading[match.id] ? 'animate-pulse cursor-wait' : ''
                           }`}
                         >
                           <Sparkles className="w-3.5 h-3.5" />
-                          <span>{aiLoading[match.id] ? "Pensando..." : "IA"}</span>
+                          <span>{aiLoading[match.id] ? 'Pensando...' : 'IA'}</span>
                         </button>
 
                         <div className="flex items-center bg-slate-950 border border-slate-800 rounded-lg p-0.5">
@@ -564,7 +562,7 @@ export default function MatchList({
                   </motion.div>
                 )}
 
-                {/* AI Advice explanation box */}
+                {/* AI advice (only when the user pre-filled via IA button and hasn't saved yet) */}
                 {aiAdvice[match.id] && !isLocked && !myPred && (
                   <motion.div
                     initial={{ opacity: 0, y: 5 }}
@@ -573,10 +571,10 @@ export default function MatchList({
                   >
                     <Sparkles className="w-4 h-4 text-teal-400 shrink-0 mt-0.5 animate-pulse" />
                     <div>
-                      <span className="font-extrabold text-teal-400">Análise de IA: </span>
+                      <span className="font-extrabold text-teal-400">Sugestão da IA: </span>
                       {aiAdvice[match.id]}
                       <p className="text-[9px] text-slate-500 mt-1 font-sans">
-                        Clique em <span className="font-bold text-emerald-400">"Salvar"</span> para confirmar este palpite no bolão se concordar!
+                        Clique em <span className="font-bold text-emerald-400">"Salvar"</span> se concordar com a sugestão.
                       </p>
                     </div>
                   </motion.div>

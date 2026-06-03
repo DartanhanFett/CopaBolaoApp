@@ -29,6 +29,9 @@ export default function SimulatorPanel({
   const [brazilScore, setBrazilScore] = useState(2);
   const [argentinaScore, setArgentinaScore] = useState(1);
 
+  // Confirmation flag for the destructive reset action
+  const [confirmingReset, setConfirmingReset] = useState(false);
+
   if (!isOpen) return null;
 
   return (
@@ -175,19 +178,42 @@ export default function SimulatorPanel({
               ⚙️ Opções Globais
             </span>
             <p className="text-xs font-semibold text-slate-200">
-              Regenerar Tudo
+              Resetar Partidas
             </p>
             <p className="text-[11px] text-slate-400 mb-4">
-              Deseja resetar as partidas de volta ao estado inicial para apostar novamente do zero?
+              Volta as partidas ao estado inicial e apaga todos os palpites. <strong className="text-amber-300">Bolões e usuários NÃO são afetados.</strong>
             </p>
           </div>
 
-          <button
-            onClick={onResetSimulator}
-            className="w-full py-1.5 px-3 bg-slate-850 hover:bg-slate-800 border border-slate-700 rounded-lg text-xs font-bold text-amber-400 hover:text-amber-300 transition flex items-center justify-center gap-1.5"
-          >
-            <RotateCcw className="w-3.5 h-3.5" /> Restaurar Estado Inicial
-          </button>
+          {confirmingReset ? (
+            <div className="space-y-2">
+              <p className="text-[11px] text-amber-300 font-bold flex items-center gap-1.5">
+                <AlertTriangle className="w-3.5 h-3.5" />
+                Confirmar reset das partidas?
+              </p>
+              <div className="flex gap-2">
+                <button
+                  onClick={() => setConfirmingReset(false)}
+                  className="flex-1 py-1.5 px-2 bg-slate-800 hover:bg-slate-750 border border-slate-700 rounded-lg text-[11px] font-bold text-slate-300 transition"
+                >
+                  Cancelar
+                </button>
+                <button
+                  onClick={() => { setConfirmingReset(false); onResetSimulator(); }}
+                  className="flex-1 py-1.5 px-2 bg-amber-500 hover:bg-amber-400 rounded-lg text-[11px] font-bold text-slate-950 transition"
+                >
+                  Sim, resetar
+                </button>
+              </div>
+            </div>
+          ) : (
+            <button
+              onClick={() => setConfirmingReset(true)}
+              className="w-full py-1.5 px-3 bg-slate-850 hover:bg-slate-800 border border-slate-700 rounded-lg text-xs font-bold text-amber-400 hover:text-amber-300 transition flex items-center justify-center gap-1.5"
+            >
+              <RotateCcw className="w-3.5 h-3.5" /> Resetar Partidas
+            </button>
+          )}
         </div>
       </div>
     </div>
