@@ -1,0 +1,28 @@
+# fly.toml app configuration file generated for copa-bolao on 2026-06-03T17:02:20-03:00
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'copa-bolao'
+primary_region = 'gru'
+
+# Build args declare which Vite-embedded variables the Docker build expects.
+# Values are passed at deploy time via `flyctl deploy --build-arg KEY=VALUE` (see deploy step).
+# These end up in the browser bundle, so only put PUBLIC values here (anon key, URL).
+# NEVER add SUPABASE_SERVICE_ROLE_KEY or any private secret to build.args.
+[build]
+  [build.args]
+    VITE_SUPABASE_URL = ""
+    VITE_SUPABASE_ANON_KEY = ""
+
+[http_service]
+  internal_port = 3000
+  force_https = true
+  auto_stop_machines = 'stop'
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ['app']
+
+[[vm]]
+  memory = '1gb'
+  cpus = 1
