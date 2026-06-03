@@ -1,10 +1,14 @@
 // CopaBolão service worker — minimal offline cache.
 // Strategy:
-//  - Static assets (HTML, JS, CSS, icons): cache-first, fall back to network.
+//  - HTML / SPA shell: NETWORK-FIRST (fall back to cache only when offline).
+//    Critical for production: ensures CSP changes / new JS bundles propagate
+//    immediately. Cache-first on the shell is what caused our infamous "old CSP
+//    keeps blocking Supabase" bug.
+//  - JS/CSS/icons (hashed by Vite): cache-first (filename change = cache miss).
 //  - API requests (/api/*): always network (don't cache live scores/predictions).
-// Bumping CACHE_VERSION invalidates the old cache on next page load.
+// Bump CACHE_VERSION whenever you want to nuke all caches across all clients.
 
-const CACHE_VERSION = "copabolao-v1";
+const CACHE_VERSION = "copabolao-v2";
 const STATIC_CACHE = `${CACHE_VERSION}-static`;
 const STATIC_ASSETS = [
   "/",
@@ -42,19 +46,42 @@ self.addEventListener("fetch", (event) => {
   // Vite dev server sockets / HMR — leave alone.
   if (url.pathname.startsWith("/@") || url.pathname.startsWith("/node_modules/")) return;
 
-  event.respondWith(
-    caches.match(req).then((cached) => {
-      if (cached) return cached;
-      return fetch(req)
+  // HTML / SPA shell goes network-first. The shell carries the CSP header and
+  // the <script src="...hashed.js"> reference, so a stale shell freezes the app
+  // on an old build. We accept a tiny latency hit for correctness.
+  const isShell =
+    req.mode === "navigate" ||
+    req.headers.get("accept")?.includes("text/html") ||
+    url.pathname === "/";
+  if (isShell) {
+    event.respondWith(
+      fetch(req)
         .then((res) => {
-          // Cache successful same-origin responses for next time.
           if (res.ok && url.origin === self.location.origin) {
             const copy = res.clone();
             caches.open(STATIC_CACHE).then((cache) => cache.put(req, copy));
           }
           return res;
         })
-        .catch(() => caches.match("/")); // offline fallback to the SPA shell
+        .catch(() => caches.match(req).then((cached) => cached || caches.match("/")))
+    );
+    return;
+  }
+
+  // Everything else (hashed JS/CSS/icons): cache-first, populate on miss.
+  event.respondWith(
+    caches.match(req).then((cached) => {
+      if (cached) return cached;
+      return fetch(req)
+        .then((res) => {
+          if (res.ok && url.origin === self.location.origin) {
+            const copy = res.clone();
+            caches.open(STATIC_CACHE).then((cache) => cache.put(req, copy));
+          }
+          return res;
+        })
+        .catch(() => caches.match("/"));
     })
   );
 });
+
