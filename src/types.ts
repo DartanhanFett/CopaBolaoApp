@@ -31,6 +31,7 @@ export interface User {
   name: string;
   avatar: string;
   email?: string;
+  isAdmin?: boolean; // Set by the server on authentication
 }
 
 export interface CommentReaction {

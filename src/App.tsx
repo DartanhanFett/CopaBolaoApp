@@ -1009,8 +1009,8 @@ export default function App() {
           );
         })()}
 
-        {/* Selected Group Header Context Card if a group is open (Only visible on Matches and Ranking tabs as requested) */}
-        {activeGroup && (activeTab === 'matches' || activeTab === 'ranking') ? (
+        {/* Selected Group Header Context Card if a group is open */}
+        {activeGroup && (activeTab === 'matches' || activeTab === 'ranking' || activeTab === 'groups') ? (
           <div className="mb-5 p-4 bg-slate-900 border border-slate-800 rounded-2xl relative shadow-md">
             <button
               onClick={() => {
