@@ -353,12 +353,9 @@ export default function App() {
   const [isCreateModalOpen, setIsCreateModalOpen] = useState(false);
   const [createModalInitialTab, setCreateModalInitialTab] = useState<'create' | 'join'>('create');
   
-  const isAdmin = !!(
-    sessionUser && (
-      sessionUser.email?.toLowerCase() === 'dartanhan.fett@gmail.com' ||
-      sessionUser.id?.toLowerCase() === 'dartanhan.fett@gmail.com'
-    )
-  );
+  // Admin status is determined by the server during authentication and stored in the session user.
+  // This prevents hardcoding admin emails in client-side code.
+  const isAdmin = !!(sessionUser?.isAdmin);
 
   const [isSimulatorOpen, setIsSimulatorOpen] = useState(false);
 

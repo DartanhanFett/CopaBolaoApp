@@ -4,14 +4,257 @@ import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type } from "@google/genai";
 import dotenv from "dotenv";
 import { createClient } from "@supabase/supabase-js";
+import { z } from "zod";
+import helmet from "helmet";
+import cors from "cors";
 import { INITIAL_USERS, INITIAL_MATCHES, INITIAL_GROUPS, INITIAL_COMMENTS } from "./src/data/initialData";
 
 dotenv.config();
 
+// ─── Zod Validation Schemas ─────────────────────────────────────────────────
+
+const footballFixturesQuerySchema = z.object({}).optional();
+
+const aiCommentBodySchema = z.object({
+  homeTeam: z.string().min(1),
+  awayTeam: z.string().min(1),
+  userComment: z.string().min(1),
+  userName: z.string().min(1),
+  userPrediction: z.string().optional(),
+  otherMembers: z.array(z.object({
+    id: z.string(),
+    name: z.string(),
+    avatar: z.string(),
+  })).optional(),
+});
+
+const aiSuggestScoreBodySchema = z.object({
+  homeTeam: z.string().min(1),
+  awayTeam: z.string().min(1),
+});
+
+const dbSyncQuerySchema = z.object({
+  table: z.enum([
+    "copabolao_matches",
+    "copabolao_users",
+    "copabolao_groups",
+    "copabolao_predictions",
+    "copabolao_comments",
+  ]).optional(),
+});
+
+const dbResetBodySchema = z.object({
+  confirmationToken: z.string().optional(),
+});
+
+const otpSendBodySchema = z.object({
+  email: z.string().email().min(1),
+  isSignUp: z.boolean().optional(),
+  name: z.string().optional(),
+});
+
+const otpVerifyBodySchema = z.object({
+  email: z.string().email().min(1),
+  token: z.string().min(6).max(6),
+  isSignUp: z.boolean().optional(),
+  name: z.string().optional(),
+  avatar: z.string().optional(),
+});
+
+const authLoginBodySchema = z.object({
+  email: z.string().email().min(1),
+});
+
+const authRegisterBodySchema = z.object({
+  email: z.string().email().min(1),
+  name: z.string().min(1),
+  avatar: z.string().optional(),
+});
+
+const dbUsersUpsertBodySchema = z.object({
+  id: z.string().min(1),
+  name: z.string().min(1),
+  avatar: z.string().min(1),
+});
+
+const dbPredictionsUpsertBodySchema = z.object({
+  id: z.string().min(1),
+  userId: z.string().min(1),
+  matchId: z.string().min(1),
+  homeScore: z.number().int().min(0),
+  awayScore: z.number().int().min(0),
+  pointsEarned: z.number().optional(),
+  groupId: z.string().nullable().optional(),
+});
+
+const dbGroupsUpsertBodySchema = z.object({
+  id: z.string().min(1),
+  name: z.string().min(1),
+  description: z.string().optional(),
+  league: z.string().min(1),
+  entryFee: z.number().min(0),
+  creatorId: z.string().min(1),
+  code: z.string().min(1),
+  members: z.array(z.string()),
+});
+
+const dbCommentsUpsertBodySchema = z.object({
+  id: z.string().min(1),
+  matchId: z.string().min(1),
+  userId: z.string().min(1),
+  userName: z.string().min(1),
+  userAvatar: z.string().min(1),
+  text: z.string().min(1),
+  timestamp: z.string().min(1),
+  reactions: z.array(z.object({
+    emoji: z.string(),
+    count: z.number().int().min(0),
+    users: z.array(z.string()),
+  })),
+});
+
+const dbMatchesUpsertBodySchema = z.object({
+  id: z.string().min(1),
+  homeTeam: z.object({
+    name: z.string(),
+    code: z.string(),
+    flagUrl: z.string(),
+  }),
+  awayTeam: z.object({
+    name: z.string(),
+    code: z.string(),
+    flagUrl: z.string(),
+  }),
+  date: z.string().min(1),
+  status: z.enum(["upcoming", "live", "completed"]),
+  homeScore: z.number().optional().nullable(),
+  awayScore: z.number().optional().nullable(),
+  scorers: z.array(z.string()).optional(),
+  league: z.string().min(1),
+});
+
+const dbGroupsDeleteBodySchema = z.object({
+  groupId: z.string().min(1),
+  userId: z.string().optional(),
+});
+
+const dbUsersDeleteBodySchema = z.object({
+  targetUserId: z.string().min(1),
+  requesterUserId: z.string().optional(),
+});
+
+// ─── Helpers ────────────────────────────────────────────────────────────────
+
+/** Sanitize error messages for production — never leak internal details to client */
+function sanitizeError(err: unknown): string {
+  if (process.env.NODE_ENV === "production") {
+    return "Ocorreu um erro interno no servidor. Tente novamente mais tarde.";
+  }
+  if (err instanceof Error) return err.message;
+  return String(err);
+}
+
+/** Log errors safely without leaking secrets */
+function logError(context: string, err: unknown): void {
+  const message = err instanceof Error ? err.message : String(err);
+  console.error(`[${context}] ${message}`);
+}
+
+// ─── Auth Middleware ────────────────────────────────────────────────────────
+
+/**
+ * Extracts Supabase JWT from Authorization header and returns the authenticated user.
+ * Uses service_role key if available, otherwise falls back to anon key.
+ * Returns null if authentication fails (caller handles 401).
+ */
+async function authenticateRequest(
+  supabase: any,
+  authHeader: string | undefined,
+): Promise<{ email: string; id: string } | null> {
+  if (!supabase) return null;
+
+  if (!authHeader?.startsWith("Bearer ")) {
+    return null;
+  }
+
+  const token = authHeader.split(" ")[1];
+  if (!token) return null;
+
+  try {
+    const { data: { user }, error } = await supabase.auth.getUser(token);
+    if (error || !user?.email) return null;
+    return { email: user.email.toLowerCase(), id: user.id };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Checks if the given email belongs to an admin (configured via ADMIN_EMAILS env var).
+ */
+function isAdminEmail(email: string): boolean {
+  const adminEmails: string[] = (process.env.ADMIN_EMAILS || "")
+    .split(",")
+    .map((e) => e.trim().toLowerCase())
+    .filter(Boolean);
+  const normalized = email.toLowerCase();
+  const hasAdminOverride = process.env.ADMIN_OVERRIDE === normalized;
+  return adminEmails.includes(normalized) || hasAdminOverride;
+}
+
+// ─── Sync Mutex ────────────────────────────────────────────────────────────
+
+/**
+ * Simple mutex to prevent race conditions during sync operations.
+ * Ensures only one sync/seed operation runs at a time.
+ */
+class SyncMutex {
+  private locked = false;
+  private queue: Array<() => void> = [];
+
+  async acquire(): Promise<void> {
+    if (!this.locked) {
+      this.locked = true;
+      return;
+    }
+    return new Promise<void>((resolve) => {
+      this.queue.push(resolve);
+    });
+  }
+
+  release(): void {
+    if (this.queue.length > 0) {
+      const next = this.queue.shift()!;
+      next();
+    } else {
+      this.locked = false;
+    }
+  }
+}
+
+// ─── Server Startup ────────────────────────────────────────────────────────
+
 async function startServer() {
   const app = express();
-  app.use(express.json());
+
+  // --- Security Headers (Helmet) ---
+  app.use(helmet({
+    contentSecurityPolicy: process.env.NODE_ENV === "production" ? undefined : false,
+  }));
+
+  // --- CORS Configuration ---
+  app.use(cors({
+    origin: process.env.CORS_ORIGIN || "*",
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+    credentials: true,
+  }));
+
+  app.use(express.json({ limit: "1mb" }));
   const PORT = 3000;
+
+  // --- Sync Mutex Instance ---
+  const syncMutex = new SyncMutex();
 
   // Supabase Client: Lazy initialization to prevent app crash if environment credentials are missing
   let supabaseInstance: any = null;
@@ -51,18 +294,17 @@ async function startServer() {
       return res.json({
         useRealData: false,
         message: "Chave FOOTBALL_API_KEY ausente. Usando partidas simuladas de alta-fidelidade.",
-        fixtures: []
+        fixtures: [],
       });
     }
 
     try {
-      // API-Football endpoint: fetching all matches for World Cup 2026 (league=1, season=2026)
       const response = await fetch("https://v3.football.api-sports.io/fixtures?league=1&season=2026", {
         method: "GET",
         headers: {
           "x-apisports-key": footballApiKey,
           "x-rapidapi-key": footballApiKey,
-        }
+        },
       });
 
       const data: any = await response.json();
@@ -70,8 +312,8 @@ async function startServer() {
       if (data.errors && Object.keys(data.errors).length > 0) {
         return res.json({
           useRealData: false,
-          message: `Erro recebido da API-Football: ${JSON.stringify(data.errors)}`,
-          fixtures: []
+          message: "API-Football retornou dados indisponíveis no momento.",
+          fixtures: [],
         });
       }
 
@@ -103,7 +345,7 @@ async function startServer() {
         scorers: [],
       }));
 
-      // Persist real matches to Supabase table so we have them loaded globally and stored securely
+      // Persist real matches to Supabase
       const supabase = getSupabaseClient();
       if (supabase && mappedFixtures.length > 0) {
         try {
@@ -116,33 +358,38 @@ async function startServer() {
             home_score: m.homeScore !== undefined ? m.homeScore : null,
             away_score: m.awayScore !== undefined ? m.awayScore : null,
             scorers: m.scorers || [],
-            league: m.league
+            league: m.league,
           }));
           await supabase.from("copabolao_matches").upsert(mappedMatchesForSupabase);
         } catch (dbErr: any) {
-          console.error("Falha ao salvar partidas reais no Supabase:", dbErr.message);
+          logError("football-fixtures-supabase", dbErr);
         }
       }
 
       return res.json({
         useRealData: true,
-        fixtures: mappedFixtures
+        fixtures: mappedFixtures,
       });
-
     } catch (err: any) {
+      logError("football-fixtures", err);
       return res.json({
         useRealData: false,
-        message: `Falha na conexão com API-Football: ${err.message}`,
-        fixtures: []
+        message: "Serviço de dados de futebol temporariamente indisponível.",
+        fixtures: [],
       });
     }
   });
 
   // REST API: Intelligent banter comments generator using Gemini (Option B)
   app.post("/api/ai/comment", async (req, res) => {
-    const { homeTeam, awayTeam, userComment, userName, userPrediction, otherMembers } = req.body;
-    
-    const randomMember = otherMembers && otherMembers.length > 0 
+    const parsed = aiCommentBodySchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ error: "Dados inválidos para geração de comentário." });
+    }
+
+    const { homeTeam, awayTeam, userComment, userName, userPrediction, otherMembers } = parsed.data;
+
+    const randomMember = otherMembers && otherMembers.length > 0
       ? otherMembers[Math.floor(Math.random() * otherMembers.length)]
       : { id: "u2", name: "Guilherme", avatar: "https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?auto=format&fit=crop&w=150&q=80" };
 
@@ -153,12 +400,12 @@ async function startServer() {
         "Estou achando que vai ser jogo duro, mas seu bolão está bem cotado!",
         "Vixi, se der esse placar eu subo pro primeiro lugar haha! 🚀🔥",
         "Concordo plenamente com o comentário de cima. Esse jogo promete!",
-        "Duvido muito hein! Mas vamos ver no final do jogo!"
+        "Duvido muito hein! Mas vamos ver no final do jogo!",
       ];
       return res.json({
         comment: fallbacks[Math.floor(Math.random() * fallbacks.length)],
         author: randomMember,
-        isAiGenerated: false
+        isAiGenerated: false,
       });
     }
 
@@ -192,40 +439,41 @@ Exemplos de tom esperado:
       return res.json({
         comment: responseText || "Rapaz, concordo com você!",
         author: randomMember,
-        isAiGenerated: true
+        isAiGenerated: true,
       });
     } catch (e: any) {
-      console.error("Gemini Generation Error:", e);
+      logError("ai-comment", e);
       return res.json({
         comment: "Olha lá hein! Jogo vai ser muito pegado!",
         author: randomMember,
-        isAiGenerated: false
+        isAiGenerated: false,
       });
     }
   });
 
   // REST API: Suggest score and prediction with AI using Gemini
   app.post("/api/ai/suggest-score", async (req, res) => {
-    const { homeTeam, awayTeam } = req.body;
-    if (!homeTeam || !awayTeam) {
-      return res.status(400).json({ error: "Times de casa e visitante são obrigatórios." });
+    const parsed = aiSuggestScoreBodySchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ error: "Dados inválidos. Informe homeTeam e awayTeam." });
     }
+
+    const { homeTeam, awayTeam } = parsed.data;
 
     const ai = getGeminiClient();
     if (!ai) {
-      // Local smart fallback
       const randomHome = Math.floor(Math.random() * 3);
       const randomAway = Math.floor(Math.random() * 3);
       const fallbacks = [
         `Clássico equilibrado! ${homeTeam} e ${awayTeam} vão se estudar bastante. Acho que sai um empate disputado ou vitória magra do time que cometer menos erros.`,
         `O time do ${homeTeam} vem de boa fase ofensiva, mas o ${awayTeam} sabe jogar bem fechadinho. Jogo de transições rápidas e forte marcação!`,
-        `Minha intuição de futebol diz que este confronto promete fortes emoções. Vejo uma leve vantagem tática para o ${homeTeam} neste momento.`
+        `Minha intuição de futebol diz que este confronto promete fortes emoções. Vejo uma leve vantagem tática para o ${homeTeam} neste momento.`,
       ];
       return res.json({
         homeScore: randomHome,
         awayScore: randomAway,
         reasoning: fallbacks[Math.floor(Math.random() * fallbacks.length)],
-        isAiGenerated: false
+        isAiGenerated: false,
       });
     }
 
@@ -262,43 +510,43 @@ Seu JSON de retorno DEVE conter estes campos exatos:
             properties: {
               homeScore: {
                 type: Type.INTEGER,
-                description: "Placar sugerido para o time de casa (home team)"
+                description: "Placar sugerido para o time de casa (home team)",
               },
               awayScore: {
                 type: Type.INTEGER,
-                description: "Placar sugerido para o time visitante (away team)"
+                description: "Placar sugerido para o time visitante (away team)",
               },
               reasoning: {
                 type: Type.STRING,
-                description: "Breve comentário justificando o palpite de forma divertida e analítica"
-              }
+                description: "Breve comentário justificando o palpite de forma divertida e analítica",
+              },
             },
-            required: ["homeScore", "awayScore", "reasoning"]
-          }
-        }
+            required: ["homeScore", "awayScore", "reasoning"],
+          },
+        },
       });
 
       const responseText = response.text || "{}";
       const parsed = JSON.parse(responseText.trim());
 
       return res.json({
-        homeScore: typeof parsed.homeScore === 'number' ? parsed.homeScore : 1,
-        awayScore: typeof parsed.awayScore === 'number' ? parsed.awayScore : 0,
+        homeScore: typeof parsed.homeScore === "number" ? parsed.homeScore : 1,
+        awayScore: typeof parsed.awayScore === "number" ? parsed.awayScore : 0,
         reasoning: parsed.reasoning || "Futebol é uma caixinha de surpresas!",
-        isAiGenerated: true
+        isAiGenerated: true,
       });
     } catch (e: any) {
-      console.error("Gemini Suggestion Error:", e);
+      logError("ai-suggest-score", e);
       return res.json({
         homeScore: 1,
         awayScore: 1,
         reasoning: "Esse jogo vai ser travado demais no meio de campo, aposto num 1 a 1 de segurança!",
-        isAiGenerated: false
+        isAiGenerated: false,
       });
     }
   });
 
-  // REST API: Sync database states with Supabase
+  // REST API: Sync database states with Supabase (race-condition protected via mutex)
   app.get("/api/db/sync", async (req, res) => {
     const supabase = getSupabaseClient();
     if (!supabase) {
@@ -308,14 +556,16 @@ Seu JSON de retorno DEVE conter estes campos exatos:
       });
     }
 
-    const tableName = req.query.table as string | undefined;
+    const queryParsed = dbSyncQuerySchema.safeParse(req.query);
+    const tableName = queryParsed.success ? queryParsed.data.table : undefined;
 
+    await syncMutex.acquire();
     try {
       if (tableName) {
         // Table-specific sync requests (polling helper)
         if (tableName === "copabolao_matches") {
           const { data, error } = await supabase.from("copabolao_matches").select("*");
-          if (error) return res.json({ success: false, error: error.message });
+          if (error) return res.json({ success: false, error: "Erro ao consultar partidas." });
           const mappedMatches = (data || []).map((m: any) => ({
             id: m.id,
             homeTeam: m.home_team,
@@ -325,19 +575,19 @@ Seu JSON de retorno DEVE conter estes campos exatos:
             homeScore: m.home_score !== null ? Number(m.home_score) : undefined,
             awayScore: m.away_score !== null ? Number(m.away_score) : undefined,
             scorers: m.scorers || [],
-            league: m.league
+            league: m.league,
           }));
           return res.json({ success: true, data: mappedMatches });
         }
         if (tableName === "copabolao_users") {
           const { data, error } = await supabase.from("copabolao_users").select("*");
-          if (error) return res.json({ success: false, error: error.message });
+          if (error) return res.json({ success: false, error: "Erro ao consultar usuários." });
           const activeUsers = (data || []).filter((u: any) => u.deleted !== true);
           return res.json({ success: true, data: activeUsers });
         }
         if (tableName === "copabolao_groups") {
           const { data, error } = await supabase.from("copabolao_groups").select("*");
-          if (error) return res.json({ success: false, error: error.message });
+          if (error) return res.json({ success: false, error: "Erro ao consultar grupos." });
           const mappedGroups = (data || [])
             .filter((g: any) => g.deleted !== true)
             .map((g: any) => ({
@@ -348,13 +598,13 @@ Seu JSON de retorno DEVE conter estes campos exatos:
               entryFee: Number(g.entry_fee || 0),
               creatorId: g.creator_id,
               code: g.code,
-              members: g.members || []
+              members: g.members || [],
             }));
           return res.json({ success: true, data: mappedGroups });
         }
         if (tableName === "copabolao_predictions") {
           const { data, error } = await supabase.from("copabolao_predictions").select("*");
-          if (error) return res.json({ success: false, error: error.message });
+          if (error) return res.json({ success: false, error: "Erro ao consultar palpites." });
           const mappedPredictions = (data || []).map((p: any) => ({
             id: p.id,
             userId: p.user_id,
@@ -362,13 +612,13 @@ Seu JSON de retorno DEVE conter estes campos exatos:
             homeScore: Number(p.home_score),
             awayScore: Number(p.away_score),
             pointsEarned: p.points_earned !== null ? Number(p.points_earned) : undefined,
-            groupId: p.group_id || null
+            groupId: p.group_id || null,
           }));
           return res.json({ success: true, data: mappedPredictions });
         }
         if (tableName === "copabolao_comments") {
           const { data, error } = await supabase.from("copabolao_comments").select("*");
-          if (error) return res.json({ success: false, error: error.message });
+          if (error) return res.json({ success: false, error: "Erro ao consultar comentários." });
           const mappedComments = (data || []).map((c: any) => ({
             id: c.id,
             matchId: c.match_id,
@@ -377,32 +627,30 @@ Seu JSON de retorno DEVE conter estes campos exatos:
             userAvatar: c.user_avatar,
             text: c.text,
             timestamp: c.timestamp,
-            reactions: c.reactions || []
+            reactions: c.reactions || [],
           }));
           return res.json({ success: true, data: mappedComments });
         }
-        return res.json({ success: false, error: `Invalid table: ${tableName}` });
+        return res.json({ success: false, error: "Tabela inválida." });
       }
 
-      // 1. Fetch Users
+      // Full sync
       const { data: users, error: uErr } = await supabase.from("copabolao_users").select("*");
-      
+
       if (uErr) {
         return res.json({
           connected: false,
-          message: `Erro na tabela de usuários. Execute o script SQL no painel Supabase! Detalhes: ${uErr.message}`,
+          message: "Banco de dados não configurado. Execute o script SQL no painel Supabase.",
         });
       }
 
-      // 2. Proactive Auto-Seeding if table is empty
+      // Proactive Auto-Seeding if table is empty
       if (!users || users.length === 0) {
         console.log("Banco Supabase vazio! Iniciando Auto-Seeding para melhor experiência inicial...");
-        
-        // Seed Users
+
         await supabase.from("copabolao_users").insert(INITIAL_USERS);
-        
-        // Seed Groups
-        const mappedGroups = INITIAL_GROUPS.map(g => ({
+
+        const mappedGroups = INITIAL_GROUPS.map((g) => ({
           id: g.id,
           name: g.name,
           description: g.description,
@@ -410,12 +658,11 @@ Seu JSON de retorno DEVE conter estes campos exatos:
           entry_fee: g.entryFee,
           creator_id: g.creatorId,
           code: g.code,
-          members: g.members
+          members: g.members,
         }));
         await supabase.from("copabolao_groups").insert(mappedGroups);
 
-        // Seed Matches
-        const mappedMatches = INITIAL_MATCHES.map(m => ({
+        const mappedMatches = INITIAL_MATCHES.map((m) => ({
           id: m.id,
           home_team: m.homeTeam,
           away_team: m.awayTeam,
@@ -424,12 +671,11 @@ Seu JSON de retorno DEVE conter estes campos exatos:
           home_score: m.homeScore,
           away_score: m.awayScore,
           scorers: m.scorers || [],
-          league: m.league
+          league: m.league,
         }));
         await supabase.from("copabolao_matches").insert(mappedMatches);
 
-        // Seed Comments
-        const mappedComments = INITIAL_COMMENTS.map(c => ({
+        const mappedComments = INITIAL_COMMENTS.map((c) => ({
           id: c.id,
           match_id: c.matchId,
           user_id: c.userId,
@@ -437,11 +683,10 @@ Seu JSON de retorno DEVE conter estes campos exatos:
           user_avatar: c.userAvatar,
           text: c.text,
           timestamp: c.timestamp,
-          reactions: c.reactions
+          reactions: c.reactions,
         }));
         await supabase.from("copabolao_comments").insert(mappedComments);
 
-        // Re-fetch users after seeding
         const { data: seededUsers } = await supabase.from("copabolao_users").select("*");
         const activeSeededUsers = (seededUsers || []).filter((u: any) => u.deleted !== true);
 
@@ -452,16 +697,16 @@ Seu JSON de retorno DEVE conter estes campos exatos:
           groups: INITIAL_GROUPS,
           predictions: [],
           comments: INITIAL_COMMENTS,
-          matches: INITIAL_MATCHES
+          matches: INITIAL_MATCHES,
         });
       }
 
-      // If already populated, fetch all other collections in parallel
+      // Already populated — fetch all collections in parallel
       const [gRes, pRes, cRes, mRes] = await Promise.all([
         supabase.from("copabolao_groups").select("*"),
         supabase.from("copabolao_predictions").select("*"),
         supabase.from("copabolao_comments").select("*"),
-        supabase.from("copabolao_matches").select("*")
+        supabase.from("copabolao_matches").select("*"),
       ]);
 
       const activeUsers = (users || []).filter((u: any) => u.deleted !== true);
@@ -476,7 +721,7 @@ Seu JSON de retorno DEVE conter estes campos exatos:
           entryFee: Number(g.entry_fee || 0),
           creatorId: g.creator_id,
           code: g.code,
-          members: g.members || []
+          members: g.members || [],
         }));
 
       const mappedPredictions = (pRes.data || []).map((p: any) => ({
@@ -486,7 +731,7 @@ Seu JSON de retorno DEVE conter estes campos exatos:
         homeScore: Number(p.home_score),
         awayScore: Number(p.away_score),
         pointsEarned: p.points_earned !== null ? Number(p.points_earned) : undefined,
-        groupId: p.group_id || null
+        groupId: p.group_id || null,
       }));
 
       const mappedComments = (cRes.data || []).map((c: any) => ({
@@ -497,7 +742,7 @@ Seu JSON de retorno DEVE conter estes campos exatos:
         userAvatar: c.user_avatar,
         text: c.text,
         timestamp: c.timestamp,
-        reactions: c.reactions || []
+        reactions: c.reactions || [],
       }));
 
       const mappedMatches = (mRes.data || []).map((m: any) => ({
@@ -509,7 +754,7 @@ Seu JSON de retorno DEVE conter estes campos exatos:
         homeScore: m.home_score !== null ? Number(m.home_score) : undefined,
         awayScore: m.away_score !== null ? Number(m.away_score) : undefined,
         scorers: m.scorers || [],
-        league: m.league
+        league: m.league,
       }));
 
       return res.json({
@@ -519,29 +764,63 @@ Seu JSON de retorno DEVE conter estes campos exatos:
         groups: mappedGroups,
         predictions: mappedPredictions,
         comments: mappedComments,
-        matches: mappedMatches.length > 0 ? mappedMatches : null
+        matches: mappedMatches.length > 0 ? mappedMatches : null,
       });
-
     } catch (e: any) {
+      logError("db-sync", e);
       return res.json({
         connected: false,
-        message: `Falha de conexão com Supabase: ${e.message}`,
+        message: "Serviço de sincronização temporariamente indisponível.",
       });
+    } finally {
+      syncMutex.release();
     }
   });
 
   // REST API: Reset database on Supabase with fresh dynamic match dates
+  // PROTECTED: Requires admin authentication via Bearer token + confirmation token
   app.post("/api/db/reset", async (req, res) => {
     const supabase = getSupabaseClient();
     if (!supabase) return res.json({ success: false, message: "Sem Supabase conectado." });
 
+    // --- VALIDATION ---
+    const parsed = dbResetBodySchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ success: false, message: "Dados inválidos." });
+    }
+
+    // --- AUTHENTICATION CHECK ---
+    const authUser = await authenticateRequest(supabase, req.headers.authorization);
+    if (!authUser) {
+      return res.status(401).json({ success: false, message: "Token de autenticação ausente ou inválido." });
+    }
+
+    // --- AUTHORIZATION CHECK ---
+    if (!isAdminEmail(authUser.email)) {
+      logError("security", `Unauthorized reset attempt by ${authUser.email}`);
+      return res.status(403).json({ success: false, message: "Acesso negado. Apenas administradores podem resetar o banco de dados." });
+    }
+
+    // --- CONFIRMATION TOKEN CHECK ---
+    const { confirmationToken } = parsed.data;
+    const expectedToken = process.env.RESET_CONFIRMATION_TOKEN;
+
+    if (expectedToken && confirmationToken !== expectedToken) {
+      return res.status(403).json({
+        success: false,
+        message: "Token de confirmação inválido. O reset requer um token de segurança adicional.",
+      });
+    }
+
+    // --- AUDIT LOG ---
+    console.warn(`[AUDIT] DATABASE RESET initiated by admin: ${authUser.email} at ${new Date().toISOString()}`);
+
+    await syncMutex.acquire();
     try {
-      // 1. Delete predictions
       await supabase.from("copabolao_predictions").delete().neq("id", "_");
 
-      // 2. Delete and re-populate comments
       await supabase.from("copabolao_comments").delete().neq("id", "_");
-      const mappedComments = INITIAL_COMMENTS.map(c => ({
+      const mappedComments = INITIAL_COMMENTS.map((c) => ({
         id: c.id,
         match_id: c.matchId,
         user_id: c.userId,
@@ -549,15 +828,14 @@ Seu JSON de retorno DEVE conter estes campos exatos:
         user_avatar: c.userAvatar,
         text: c.text,
         timestamp: c.timestamp,
-        reactions: c.reactions
+        reactions: c.reactions,
       }));
       if (mappedComments.length > 0) {
         await supabase.from("copabolao_comments").insert(mappedComments);
       }
 
-      // 3. Delete and re-populate groups
       await supabase.from("copabolao_groups").delete().neq("id", "_");
-      const mappedGroups = INITIAL_GROUPS.map(g => ({
+      const mappedGroups = INITIAL_GROUPS.map((g) => ({
         id: g.id,
         name: g.name,
         description: g.description,
@@ -565,16 +843,14 @@ Seu JSON de retorno DEVE conter estes campos exatos:
         entry_fee: g.entryFee,
         creator_id: g.creatorId,
         code: g.code,
-        members: g.members
+        members: g.members,
       }));
       if (mappedGroups.length > 0) {
         await supabase.from("copabolao_groups").insert(mappedGroups);
       }
 
-      // 4. Delete and re-populate matches with clean dynamic World Cup dates from INITIAL_MATCHES
       await supabase.from("copabolao_matches").delete().neq("id", "_");
-      
-      const mappedMatches = INITIAL_MATCHES.map(m => ({
+      const mappedMatches = INITIAL_MATCHES.map((m) => ({
         id: m.id,
         home_team: m.homeTeam,
         away_team: m.awayTeam,
@@ -583,30 +859,32 @@ Seu JSON de retorno DEVE conter estes campos exatos:
         home_score: m.homeScore !== undefined ? m.homeScore : null,
         away_score: m.awayScore !== undefined ? m.awayScore : null,
         scorers: m.scorers || [],
-        league: m.league
+        league: m.league,
       }));
       await supabase.from("copabolao_matches").insert(mappedMatches);
 
       return res.json({ success: true, matches: INITIAL_MATCHES });
     } catch (error: any) {
-      console.error("Erro ao resetar no Supabase:", error);
-      return res.json({ success: false, error: error.message });
+      logError("db-reset", error);
+      return res.json({ success: false, message: "Erro ao resetar banco de dados." });
+    } finally {
+      syncMutex.release();
     }
   });
 
   // OTP Verification API: Send OTP Code
   app.post("/api/auth/otp/send", async (req, res) => {
-    const supabase = getSupabaseClient();
-    const { email, isSignUp, name } = req.body;
-    if (!email) {
-      return res.json({ success: false, message: "E-mail é obrigatório." });
+    const parsed = otpSendBodySchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ success: false, message: "E-mail inválido ou ausente." });
     }
 
+    const supabase = getSupabaseClient();
+    const { email, isSignUp, name } = parsed.data;
     const keyId = email.toLowerCase().trim();
 
     try {
       if (supabase) {
-        // 1. Validation checks before sending code to improve UX
         const { data: existingUser } = await supabase
           .from("copabolao_users")
           .select("*")
@@ -623,73 +901,70 @@ Seu JSON de retorno DEVE conter estes campos exatos:
           }
         }
 
-        // 2. Send real Supabase OTP
         const { error } = await supabase.auth.signInWithOtp({
           email: keyId,
           options: {
-            shouldCreateUser: true
-          }
+            shouldCreateUser: true,
+          },
         });
 
         if (error) {
-          console.error("Supabase OTP send error:", error);
-          return res.json({ success: false, message: `Erro ao enviar e-mail OTP de acesso: ${error.message}` });
+          logError("otp-send", error);
+          return res.json({ success: false, message: "Erro ao enviar o código de acesso. Tente novamente." });
         }
 
         return res.json({
           success: true,
           message: "Código enviado! Verifique sua caixa de entrada.",
-          isMock: false
+          isMock: false,
         });
       } else {
-        // Offline/Mock mode fallback when no Supabase credentials are set
         console.log(`[MOCK AUTH] Envio simulado de OTP para: ${keyId}`);
         return res.json({
           success: true,
           message: "Modo de simulação ativo: Seu código OTP de teste é 123456",
           isMock: true,
-          mockCode: "123456"
+          mockCode: "123456",
         });
       }
     } catch (err: any) {
-      return res.json({ success: false, message: `Erro ao processar OTP: ${err.message}` });
+      logError("otp-send", err);
+      return res.json({ success: false, message: "Erro ao processar solicitação de código." });
     }
   });
 
   // OTP Verification API: Verify Code & Session Setup
   app.post("/api/auth/otp/verify", async (req, res) => {
-    const supabase = getSupabaseClient();
-    const { email, token, isSignUp, name, avatar } = req.body;
-    if (!email || !token) {
-      return res.json({ success: false, message: "E-mail e código OTP são obrigatórios." });
+    const parsed = otpVerifyBodySchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ success: false, message: "Dados inválidos. Informe e-mail e código de 6 dígitos." });
     }
 
+    const supabase = getSupabaseClient();
+    const { email, token, isSignUp, name, avatar } = parsed.data;
     const keyId = email.toLowerCase().trim();
 
     try {
       if (supabase) {
-        // 1. Verify OTP token through Supabase Auth
         const { error: verifyError } = await supabase.auth.verifyOtp({
           email: keyId,
           token: token.trim(),
-          type: "email"
+          type: "email",
         });
 
         if (verifyError) {
-          // If type email fails, try fallback verify with 'signup' type just in case Supabase expects it
           const { error: retryError } = await supabase.auth.verifyOtp({
             email: keyId,
             token: token.trim(),
-            type: "signup"
+            type: "signup",
           });
 
           if (retryError) {
-            console.error("Verify OTP error:", verifyError, retryError);
-            return res.json({ success: false, message: `Código incorreto ou expirado: ${verifyError.message || retryError.message}` });
+            logError("otp-verify", verifyError || retryError);
+            return res.json({ success: false, message: "Código incorreto ou expirado. Solicite um novo código." });
           }
         }
 
-        // 2. Fetch or create the user profile in database
         const { data: existingUser } = await supabase
           .from("copabolao_users")
           .select("*")
@@ -700,8 +975,7 @@ Seu JSON de retorno DEVE conter estes campos exatos:
 
         if (isSignUp) {
           if (existingUser) {
-            // Reactivate
-            const { data: updated, error: uErr } = await supabase
+            const { data: updated } = await supabase
               .from("copabolao_users")
               .update({ deleted: false, name: (name || existingUser.name || "Palpiteiro").trim(), avatar: avatar || existingUser.avatar })
               .eq("id", keyId)
@@ -709,27 +983,19 @@ Seu JSON de retorno DEVE conter estes campos exatos:
               .single();
             finalUser = updated;
           } else {
-            // New register insert
-            const { data: inserted, error: iErr } = await supabase
+            const { data: inserted } = await supabase
               .from("copabolao_users")
               .insert({
                 id: keyId,
                 name: (name || "Palpiteiro").trim(),
                 avatar: avatar || "https://api.dicebear.com/7.x/adventurer/svg?seed=Felix",
-                deleted: false
+                deleted: false,
               })
               .select()
               .single();
-            if (iErr) {
-              console.error("Error creating user profile in copabolao_users:", iErr);
-              // Fallback
-              finalUser = { id: keyId, name: (name || "Palpiteiro").trim(), avatar: avatar || "https://api.dicebear.com/7.x/adventurer/svg?seed=Felix" };
-            } else {
-              finalUser = inserted;
-            }
+            finalUser = inserted || { id: keyId, name: (name || "Palpiteiro").trim(), avatar: avatar || "https://api.dicebear.com/7.x/adventurer/svg?seed=Felix" };
           }
         } else {
-          // Sign in: ensure user exists
           if (!existingUser) {
             const { data: inserted } = await supabase
               .from("copabolao_users")
@@ -737,7 +1003,7 @@ Seu JSON de retorno DEVE conter estes campos exatos:
                 id: keyId,
                 name: (name || "Palpiteiro").trim(),
                 avatar: avatar || "https://api.dicebear.com/7.x/adventurer/svg?seed=Felix",
-                deleted: false
+                deleted: false,
               })
               .select()
               .single();
@@ -751,11 +1017,10 @@ Seu JSON de retorno DEVE conter estes campos exatos:
             id: finalUser.id,
             name: finalUser.name,
             avatar: finalUser.avatar,
-            email: finalUser.id
-          }
+            email: finalUser.id,
+          },
         });
       } else {
-        // Offline / Mock mode verification
         if (token.trim() === "123456" || token.trim() === "654321") {
           return res.json({
             success: true,
@@ -763,25 +1028,29 @@ Seu JSON de retorno DEVE conter estes campos exatos:
               id: keyId,
               name: (name || "User Teste").trim(),
               avatar: avatar || "https://api.dicebear.com/7.x/adventurer/svg?seed=Felix",
-              email: keyId
-            }
+              email: keyId,
+            },
           });
         } else {
           return res.json({ success: false, message: "Código incorreto! No modo simulado use '123456'." });
         }
       }
     } catch (err: any) {
-      return res.json({ success: false, message: `Erro ao verificar OTP: ${err.message}` });
+      logError("otp-verify", err);
+      return res.json({ success: false, message: "Erro ao verificar código de acesso." });
     }
   });
 
   // REST API: Standard Account Login
   app.post("/api/auth/login", async (req, res) => {
+    const parsed = authLoginBodySchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ success: false, message: "E-mail inválido ou ausente." });
+    }
+
     const supabase = getSupabaseClient();
     if (!supabase) return res.json({ success: false, message: "Sem Supabase conectado." });
-    const { email } = req.body;
-    if (!email) return res.json({ success: false, message: "E-mail é obrigatório." });
-
+    const { email } = parsed.data;
     const keyId = email.toLowerCase().trim();
 
     try {
@@ -801,25 +1070,28 @@ Seu JSON de retorno DEVE conter estes campos exatos:
           id: data.id,
           name: data.name,
           avatar: data.avatar,
-          email: data.id
-        }
+          email: data.id,
+        },
       });
     } catch (err: any) {
-      return res.json({ success: false, message: `Erro de login: ${err.message}` });
+      logError("auth-login", err);
+      return res.json({ success: false, message: "Erro ao processar login." });
     }
   });
 
   // REST API: Standard Account Registration
   app.post("/api/auth/register", async (req, res) => {
+    const parsed = authRegisterBodySchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ success: false, message: "Dados inválidos. Informe nome e e-mail." });
+    }
+
     const supabase = getSupabaseClient();
     if (!supabase) return res.json({ success: false, message: "Sem Supabase conectado." });
-    const { email, name, avatar } = req.body;
-    if (!email || !name) return res.json({ success: false, message: "Nome e E-mail são obrigatórios." });
-
+    const { email, name, avatar } = parsed.data;
     const keyId = email.toLowerCase().trim();
 
     try {
-      // Check if user exists
       const { data: existingUser } = await supabase
         .from("copabolao_users")
         .select("*")
@@ -828,72 +1100,95 @@ Seu JSON de retorno DEVE conter estes campos exatos:
 
       if (existingUser) {
         if (existingUser.deleted === true) {
-          // Reactivate previously deleted user!
           const { error: reactivateErr } = await supabase
             .from("copabolao_users")
             .update({ deleted: false, name: name.trim(), avatar })
             .eq("id", keyId);
           if (reactivateErr) {
-            return res.json({ success: false, message: `Erro ao reativar conta: ${reactivateErr.message}` });
+            logError("auth-register-reactivate", reactivateErr);
+            return res.json({ success: false, message: "Erro ao reativar conta." });
           }
           return res.json({
             success: true,
-            user: {
-              id: keyId,
-              name: name.trim(),
-              avatar,
-              email: keyId
-            }
+            user: { id: keyId, name: name.trim(), avatar, email: keyId },
           });
         }
         return res.json({ success: false, message: "Este e-mail já está cadastrado. Alterne para a aba 'Entrar'." });
       }
 
-      // Create new user in Supabase
       const { error } = await supabase
         .from("copabolao_users")
-        .insert({
-          id: keyId,
-          name: name.trim(),
-          avatar: avatar
-        });
+        .insert({ id: keyId, name: name.trim(), avatar });
 
       if (error) {
-        return res.json({ success: false, message: `Erro ao salvar usuário: ${error.message}` });
+        logError("auth-register-insert", error);
+        return res.json({ success: false, message: "Erro ao cadastrar usuário." });
       }
 
       return res.json({
         success: true,
-        user: {
-          id: keyId,
-          name: name.trim(),
-          avatar: avatar,
-          email: keyId
-        }
+        user: { id: keyId, name: name.trim(), avatar, email: keyId },
       });
     } catch (err: any) {
-      return res.json({ success: false, message: `Erro de cadastro: ${err.message}` });
+      logError("auth-register", err);
+      return res.json({ success: false, message: "Erro ao processar cadastro." });
     }
   });
 
+  // ─── DB Operations (all protected by auth + Zod validation) ────────────
+
   // REST API: Upsert user to Supabase
   app.post("/api/db/users", async (req, res) => {
+    const parsed = dbUsersUpsertBodySchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ success: false, message: "Dados do usuário inválidos." });
+    }
+
     const supabase = getSupabaseClient();
     if (!supabase) return res.json({ success: false, message: "Sem Supabase" });
-    const { id, name, avatar } = req.body;
+
+    // Auth check: user can only upsert their own profile
+    const authUser = await authenticateRequest(supabase, req.headers.authorization);
+    if (!authUser) {
+      return res.status(401).json({ success: false, message: "Autenticação necessária." });
+    }
+    if (authUser.id !== parsed.data.id && !isAdminEmail(authUser.email)) {
+      return res.status(403).json({ success: false, message: "Você só pode modificar seu próprio perfil." });
+    }
+
     try {
+      const { id, name, avatar } = parsed.data;
       const { error } = await supabase.from("copabolao_users").upsert({ id, name, avatar });
-      return res.json({ success: !error, error });
+      if (error) {
+        logError("db-users-upsert", error);
+      }
+      return res.json({ success: !error });
     } catch (error: any) {
-      return res.json({ success: false, error: error.message });
+      logError("db-users", error);
+      return res.json({ success: false, error: "Erro ao salvar usuário." });
     }
   });
 
   // REST API: Upsert prediction to Supabase
   app.post("/api/db/predictions", async (req, res) => {
+    const parsed = dbPredictionsUpsertBodySchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ success: false, message: "Dados do palpite inválidos." });
+    }
+
     const supabase = getSupabaseClient();
     if (!supabase) return res.json({ success: false, message: "Sem Supabase" });
-    const { id, userId, matchId, homeScore, awayScore, pointsEarned, groupId } = req.body;
+
+    // Auth check: user can only upsert their own predictions
+    const authUser = await authenticateRequest(supabase, req.headers.authorization);
+    if (!authUser) {
+      return res.status(401).json({ success: false, message: "Autenticação necessária." });
+    }
+    if (authUser.id !== parsed.data.userId && !isAdminEmail(authUser.email)) {
+      return res.status(403).json({ success: false, message: "Você só pode modificar seus próprios palpites." });
+    }
+
+    const { id, userId, matchId, homeScore, awayScore, pointsEarned, groupId } = parsed.data;
     try {
       let { error } = await supabase.from("copabolao_predictions").upsert({
         id,
@@ -902,7 +1197,7 @@ Seu JSON de retorno DEVE conter estes campos exatos:
         home_score: homeScore,
         away_score: awayScore,
         points_earned: pointsEarned !== undefined ? pointsEarned : null,
-        group_id: groupId || null
+        group_id: groupId || null,
       });
 
       if (error && error.message?.includes("group_id")) {
@@ -913,22 +1208,39 @@ Seu JSON de retorno DEVE conter estes campos exatos:
           match_id: matchId,
           home_score: homeScore,
           away_score: awayScore,
-          points_earned: pointsEarned !== undefined ? pointsEarned : null
+          points_earned: pointsEarned !== undefined ? pointsEarned : null,
         });
         error = fallback.error;
       }
 
-      return res.json({ success: !error, error });
+      if (error) logError("db-predictions-upsert", error);
+      return res.json({ success: !error });
     } catch (error: any) {
-      return res.json({ success: false, error: error.message });
+      logError("db-predictions", error);
+      return res.json({ success: false, error: "Erro ao salvar palpite." });
     }
   });
 
   // REST API: Upsert group to Supabase
   app.post("/api/db/groups", async (req, res) => {
+    const parsed = dbGroupsUpsertBodySchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ success: false, message: "Dados do grupo inválidos." });
+    }
+
     const supabase = getSupabaseClient();
     if (!supabase) return res.json({ success: false, message: "Sem Supabase" });
-    const { id, name, description, league, entryFee, creatorId, code, members } = req.body;
+
+    // Auth check: user can only upsert their own groups
+    const authUser = await authenticateRequest(supabase, req.headers.authorization);
+    if (!authUser) {
+      return res.status(401).json({ success: false, message: "Autenticação necessária." });
+    }
+    if (authUser.id !== parsed.data.creatorId && !isAdminEmail(authUser.email)) {
+      return res.status(403).json({ success: false, message: "Você só pode modificar seus próprios grupos." });
+    }
+
+    const { id, name, description, league, entryFee, creatorId, code, members } = parsed.data;
     try {
       const { error } = await supabase.from("copabolao_groups").upsert({
         id,
@@ -938,19 +1250,36 @@ Seu JSON de retorno DEVE conter estes campos exatos:
         entry_fee: entryFee,
         creator_id: creatorId,
         code,
-        members
+        members,
       });
-      return res.json({ success: !error, error });
+      if (error) logError("db-groups-upsert", error);
+      return res.json({ success: !error });
     } catch (error: any) {
-      return res.json({ success: false, error: error.message });
+      logError("db-groups", error);
+      return res.json({ success: false, error: "Erro ao salvar grupo." });
     }
   });
 
   // REST API: Upsert comment to Supabase
   app.post("/api/db/comments", async (req, res) => {
+    const parsed = dbCommentsUpsertBodySchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ success: false, message: "Dados do comentário inválidos." });
+    }
+
     const supabase = getSupabaseClient();
     if (!supabase) return res.json({ success: false, message: "Sem Supabase" });
-    const { id, matchId, userId, userName, userAvatar, text, timestamp, reactions } = req.body;
+
+    // Auth check: user can only upsert their own comments
+    const authUser = await authenticateRequest(supabase, req.headers.authorization);
+    if (!authUser) {
+      return res.status(401).json({ success: false, message: "Autenticação necessária." });
+    }
+    if (authUser.id !== parsed.data.userId && !isAdminEmail(authUser.email)) {
+      return res.status(403).json({ success: false, message: "Você só pode modificar seus próprios comentários." });
+    }
+
+    const { id, matchId, userId, userName, userAvatar, text, timestamp, reactions } = parsed.data;
     try {
       const { error } = await supabase.from("copabolao_comments").upsert({
         id,
@@ -960,19 +1289,36 @@ Seu JSON de retorno DEVE conter estes campos exatos:
         user_avatar: userAvatar,
         text,
         timestamp,
-        reactions
+        reactions,
       });
-      return res.json({ success: !error, error });
+      if (error) logError("db-comments-upsert", error);
+      return res.json({ success: !error });
     } catch (error: any) {
-      return res.json({ success: false, error: error.message });
+      logError("db-comments", error);
+      return res.json({ success: false, error: "Erro ao salvar comentário." });
     }
   });
 
   // REST API: Upsert match to Supabase (Simulator sync)
   app.post("/api/db/matches", async (req, res) => {
+    const parsed = dbMatchesUpsertBodySchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ success: false, message: "Dados da partida inválidos." });
+    }
+
     const supabase = getSupabaseClient();
     if (!supabase) return res.json({ success: false, message: "Sem Supabase" });
-    const { id, homeTeam, awayTeam, date, status, homeScore, awayScore, scorers, league } = req.body;
+
+    // Auth check: only admins can upsert matches
+    const authUser = await authenticateRequest(supabase, req.headers.authorization);
+    if (!authUser) {
+      return res.status(401).json({ success: false, message: "Autenticação necessária." });
+    }
+    if (!isAdminEmail(authUser.email)) {
+      return res.status(403).json({ success: false, message: "Apenas administradores podem modificar partidas." });
+    }
+
+    const { id, homeTeam, awayTeam, date, status, homeScore, awayScore, scorers, league } = parsed.data;
     try {
       const { error } = await supabase.from("copabolao_matches").upsert({
         id,
@@ -983,25 +1329,36 @@ Seu JSON de retorno DEVE conter estes campos exatos:
         home_score: homeScore !== undefined ? homeScore : null,
         away_score: awayScore !== undefined ? awayScore : null,
         scorers,
-        league
+        league,
       });
-      return res.json({ success: !error, error });
+      if (error) logError("db-matches-upsert", error);
+      return res.json({ success: !error });
     } catch (error: any) {
-      return res.json({ success: false, error: error.message });
+      logError("db-matches", error);
+      return res.json({ success: false, error: "Erro ao salvar partida." });
     }
   });
 
-  // REST API: Delete group (Soft Delete with hard-delete fallback if column doesn't exist)
+  // REST API: Delete group (Soft Delete with hard-delete fallback)
   app.post("/api/db/groups/delete", async (req, res) => {
+    const parsed = dbGroupsDeleteBodySchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ success: false, message: "Dados inválidos para exclusão do grupo." });
+    }
+
     const supabase = getSupabaseClient();
     if (!supabase) {
-      // Allow testing/local deletion when Supabase is not configured yet
       return res.json({ success: true, message: "Deletado em modo de simulação local com sucesso.", mode: "simulated-local" });
     }
-    const { groupId, userId } = req.body;
 
+    // Auth check
+    const authUser = await authenticateRequest(supabase, req.headers.authorization);
+    if (!authUser) {
+      return res.status(401).json({ success: false, message: "Autenticação necessária." });
+    }
+
+    const { groupId, userId } = parsed.data;
     try {
-      // Fetch group creator id first to check privilege
       const { data: group, error: fetchErr } = await supabase
         .from("copabolao_groups")
         .select("*")
@@ -1009,24 +1366,23 @@ Seu JSON de retorno DEVE conter estes campos exatos:
         .maybeSingle();
 
       if (fetchErr) {
-        // If the table doesn't exist or doesn't have permissions, return success to let the user delete it from localStorage
         if (fetchErr.code === "42P01" || fetchErr.message?.includes("does not exist") || fetchErr.message?.includes("relation")) {
-          return res.json({ 
-            success: true, 
-            message: "Excluído com sucesso (modo local temporário - execute os scripts SQL no painel do Supabase!).", 
-            mode: "simulated-local-fallback" 
+          return res.json({
+            success: true,
+            message: "Excluído com sucesso (modo local temporário - execute os scripts SQL no painel do Supabase!).",
+            mode: "simulated-local-fallback",
           });
         }
-        return res.json({ success: false, message: `Erro ao buscar o bolão: ${fetchErr.message}` });
+        return res.json({ success: false, message: "Erro ao verificar permissões do bolão." });
       }
 
       if (!group) {
-        // If not found in DB but client requested it, succeed local cleanup
         return res.json({ success: true, message: "Removido localmente com sucesso.", mode: "not-found-fallback" });
       }
 
-      const isAdmin = userId?.toLowerCase() === "dartanhan.fett@gmail.com";
-      const isCreator = group.creator_id?.toLowerCase() === userId?.toLowerCase();
+      const normalizedUserId = userId?.toLowerCase() || "";
+      const isAdmin = isAdminEmail(authUser.email);
+      const isCreator = group.creator_id?.toLowerCase() === normalizedUserId;
 
       if (!isAdmin && !isCreator) {
         return res.json({ success: false, message: "Você não tem permissão para deletar este grupo. Apenas o criador ou o administrador podem deletá-lo." });
@@ -1040,19 +1396,16 @@ Seu JSON de retorno DEVE conter estes campos exatos:
 
       if (updateErr) {
         console.log("Soft-delete falhou (provavelmente sem a coluna 'deleted'). Executando Hard Delete...");
-        // Fallback to hard delete
         const { error: hardDeleteErr } = await supabase
           .from("copabolao_groups")
           .delete()
           .eq("id", groupId);
 
         if (hardDeleteErr) {
-          // If hard delete fails (e.g. constraints/RLS), return success inside local context so user is not stuck
-          return res.json({ 
-            success: true, 
-            message: "Excluído com sucesso localmente (erro ao excluir no Supabase).", 
+          return res.json({
+            success: true,
+            message: "Excluído com sucesso localmente.",
             mode: "simulated-local-fallback",
-            details: hardDeleteErr.message 
           });
         }
         return res.json({ success: true, mode: "hard-delete", message: "Bolão excluído permanentemente do Supabase." });
@@ -1060,32 +1413,44 @@ Seu JSON de retorno DEVE conter estes campos exatos:
 
       return res.json({ success: true, mode: "soft-delete", message: "Bolão excluído com sucesso." });
     } catch (err: any) {
-      return res.json({ 
-        success: true, 
-        message: "Excluído com sucesso localmente.", 
-        mode: "simulated-local-error-fallback" 
+      logError("db-groups-delete", err);
+      return res.json({
+        success: true,
+        message: "Excluído com sucesso localmente.",
+        mode: "simulated-local-error-fallback",
       });
     }
   });
 
-  // REST API: Delete user (Soft Delete with hard-delete fallback if column doesn't exist)
+  // REST API: Delete user (Soft Delete with hard-delete fallback)
   app.post("/api/db/users/delete", async (req, res) => {
+    const parsed = dbUsersDeleteBodySchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ success: false, message: "Dados inválidos para exclusão de conta." });
+    }
+
     const supabase = getSupabaseClient();
     if (!supabase) {
-      // Allow testing/local account deletion when Supabase is not configured yet
       return res.json({ success: true, message: "Deletado em modo de simulação local com sucesso.", mode: "simulated-local" });
     }
-    const { targetUserId, requesterUserId } = req.body;
 
-    const isAdmin = requesterUserId?.toLowerCase() === "dartanhan.fett@gmail.com";
-    const isSelf = targetUserId?.toLowerCase() === requesterUserId?.toLowerCase();
+    // Auth check
+    const authUser = await authenticateRequest(supabase, req.headers.authorization);
+    if (!authUser) {
+      return res.status(401).json({ success: false, message: "Autenticação necessária." });
+    }
+
+    const { targetUserId, requesterUserId } = parsed.data;
+    const normalizedRequesterId = requesterUserId?.toLowerCase() || "";
+    const normalizedTargetId = targetUserId?.toLowerCase() || "";
+    const isAdmin = isAdminEmail(authUser.email);
+    const isSelf = normalizedTargetId === normalizedRequesterId || authUser.id === normalizedTargetId;
 
     if (!isAdmin && !isSelf) {
       return res.json({ success: false, message: "Apenas administradores ou o próprio usuário podem deletar esta conta." });
     }
 
     try {
-      // Try soft-delete
       const { error: updateErr } = await supabase
         .from("copabolao_users")
         .update({ deleted: true })
@@ -1093,19 +1458,16 @@ Seu JSON de retorno DEVE conter estes campos exatos:
 
       if (updateErr) {
         console.log("Soft-delete de usuário falhou (provavelmente sem a coluna 'deleted'). Executando Hard Delete...");
-        // Fallback to hard delete
         const { error: hardDeleteErr } = await supabase
           .from("copabolao_users")
           .delete()
           .eq("id", targetUserId);
 
         if (hardDeleteErr) {
-          // If hard delete fails (due to database constraints or foreign keys), return success so the browser can log out and clear storage
-          return res.json({ 
-            success: true, 
-            message: "Sua conta foi removida com sucesso localmente.", 
+          return res.json({
+            success: true,
+            message: "Sua conta foi removida com sucesso localmente.",
             mode: "simulated-local-fallback",
-            details: hardDeleteErr.message 
           });
         }
         return res.json({ success: true, mode: "hard-delete", message: "Sua conta foi excluída permanentemente do Supabase." });
@@ -1113,10 +1475,11 @@ Seu JSON de retorno DEVE conter estes campos exatos:
 
       return res.json({ success: true, mode: "soft-delete", message: "Sua conta foi excluída com sucesso." });
     } catch (err: any) {
-      return res.json({ 
-        success: true, 
-        message: "Sua conta foi excluída com sucesso localmente.", 
-        mode: "simulated-local-error-fallback" 
+      logError("db-users-delete", err);
+      return res.json({
+        success: true,
+        message: "Sua conta foi excluída com sucesso localmente.",
+        mode: "simulated-local-error-fallback",
       });
     }
   });
