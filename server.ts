@@ -11,6 +11,7 @@ import rateLimit from "express-rate-limit";
 import { INITIAL_USERS, INITIAL_MATCHES, INITIAL_GROUPS, INITIAL_COMMENTS } from "./src/data/initialData";
 import { calculatePredictionPoints } from "./src/utils/rules";
 import { DEFAULT_GROUP } from "./src/data/constants";
+import { mapTeam, teamFlagUrl } from "./src/data/teamMap";
 
 dotenv.config();
 
@@ -237,6 +238,122 @@ async function ensureDefaultGroup(supabase: any): Promise<void> {
     // Non-fatal — if this fails, the user can still use the app, just won't see the
     // welcome offer. Worth logging so we notice if it's chronic.
     logError("ensure-default-group", err);
+  }
+}
+
+// ─── OpenFootball Sync ─────────────────────────────────────────────────────
+
+const OPENFOOTBALL_URL = "https://raw.githubusercontent.com/openfootball/worldcup.json/master/2026/worldcup.json";
+
+interface OpenFootballMatch {
+  round: string;
+  date: string;     // YYYY-MM-DD
+  time: string;     // "HH:MM UTC-X" (sometimes UTC offset varies)
+  team1: string;
+  team2: string;
+  group?: string;
+  ground?: string;
+  score?: { ft?: [number, number]; ht?: [number, number] };
+}
+
+/**
+ * Parses an OpenFootball timestamp ("13:00 UTC-6") + date ("2026-06-11")
+ * into an ISO string. The UTC offset format is non-standard so we parse it
+ * manually instead of trusting Date() to do it.
+ */
+function openFootballToISO(date: string, time: string): string {
+  // time looks like "13:00 UTC-6" or "20:00 UTC-6" or "12:00 UTC-7" or "15:00 UTC-4".
+  const match = time.match(/^(\d{1,2}):(\d{2})\s+UTC([+-])(\d{1,2})$/);
+  if (!match) {
+    // Fall back to UTC midnight if format is unexpected.
+    return new Date(`${date}T00:00:00Z`).toISOString();
+  }
+  const [, hh, mm, sign, offsetHours] = match;
+  // To convert local UTC-N to UTC: add N hours when offset is negative (UTC-6 means 6h behind UTC).
+  const offsetMs = parseInt(offsetHours, 10) * 60 * 60 * 1000 * (sign === "-" ? 1 : -1);
+  const localDate = new Date(`${date}T${hh.padStart(2, "0")}:${mm}:00Z`);
+  return new Date(localDate.getTime() + offsetMs).toISOString();
+}
+
+/**
+ * Fetches the OpenFootball 2026 World Cup JSON, transforms each match into
+ * our Match shape, and upserts into copabolao_matches. PRESERVES live scores —
+ * if a match already has homeScore/awayScore set in the DB, we keep them so the
+ * admin's manual score entries via Simulator aren't blown away by the daily sync.
+ *
+ * Returns { synced: <count>, error?: <message> } for caller observability.
+ */
+async function syncWorldCupMatches(supabase: any): Promise<{ synced: number; error?: string }> {
+  if (!supabase) return { synced: 0, error: "Supabase indisponível" };
+
+  try {
+    const response = await fetch(OPENFOOTBALL_URL, { cache: "no-store" } as any);
+    if (!response.ok) {
+      return { synced: 0, error: `OpenFootball respondeu ${response.status}` };
+    }
+    const data = await response.json() as { matches: OpenFootballMatch[] };
+    if (!data.matches || !Array.isArray(data.matches)) {
+      return { synced: 0, error: "Formato inválido do OpenFootball" };
+    }
+
+    // Pull existing matches once so we can preserve their scores/status.
+    // Only the rows we're about to touch matter, but the table is small enough
+    // (≤ 104) that fetching everything is cheaper than per-match queries.
+    const { data: existing } = await supabase
+      .from("copabolao_matches")
+      .select("id,status,home_score,away_score,scorers");
+    const existingById = new Map<string, any>();
+    for (const row of existing || []) {
+      existingById.set(row.id, row);
+    }
+
+    const upserts = data.matches.map((m, idx) => {
+      // Stable IDs keyed by date + slugged teams. Index suffix protects against
+      // theoretical duplicates (same teams on same day in different rounds).
+      const slug = (s: string) => s.replace(/[^a-zA-Z0-9]/g, "").toLowerCase();
+      const id = `wc2026_${m.date}_${slug(m.team1)}_${slug(m.team2)}_${idx}`;
+
+      const home = mapTeam(m.team1);
+      const away = mapTeam(m.team2);
+      const dateIso = openFootballToISO(m.date, m.time);
+
+      const prior = existingById.get(id);
+      // Live state takes priority over the upstream sync — admin updates via
+      // the Simulator must survive subsequent calendar refreshes.
+      const status = prior?.status && prior.status !== "upcoming" ? prior.status : "upcoming";
+      const homeScore = prior?.home_score ?? null;
+      const awayScore = prior?.away_score ?? null;
+      const scorers = prior?.scorers ?? [];
+
+      return {
+        id,
+        home_team: { name: home.name, code: home.code, flagUrl: teamFlagUrl(home.iso2) },
+        away_team: { name: away.name, code: away.code, flagUrl: teamFlagUrl(away.iso2) },
+        date: dateIso,
+        status,
+        home_score: homeScore,
+        away_score: awayScore,
+        scorers,
+        league: "Copa do Mundo 2026",
+      };
+    });
+
+    // Upsert in batches of 50 to keep request size sane.
+    const BATCH = 50;
+    let total = 0;
+    for (let i = 0; i < upserts.length; i += BATCH) {
+      const batch = upserts.slice(i, i + BATCH);
+      const { error } = await supabase.from("copabolao_matches").upsert(batch);
+      if (error) {
+        logError("worldcup-sync-batch", error);
+        return { synced: total, error: error.message };
+      }
+      total += batch.length;
+    }
+    return { synced: total };
+  } catch (err: any) {
+    logError("worldcup-sync", err);
+    return { synced: 0, error: err?.message || "Erro desconhecido no sync" };
   }
 }
 
@@ -486,97 +603,75 @@ Responda APENAS o JSON.`;
   });
 
 
-  // REST API: Get Real-Time Match Data (API-Football integration proxy)
-  app.get("/api/football/fixtures", async (req, res) => {
-    const footballApiKey = process.env.FOOTBALL_API_KEY;
-    if (!footballApiKey) {
+  // REST API: Get Real-Time Match Data
+  // Backed by OpenFootball (free, public-domain JSON in GitHub) instead of the
+  // paywalled API-Football. The actual sync runs on the server (cron + admin endpoint),
+  // so this endpoint just reports current cache status to the client. The client
+  // reads fixtures from /api/db/sync which queries Supabase directly.
+  app.get("/api/football/fixtures", async (_req, res) => {
+    const supabase = getSupabaseClient();
+    if (!supabase) {
       return res.json({
         useRealData: false,
-        message: "Chave FOOTBALL_API_KEY ausente. Usando partidas simuladas de alta-fidelidade.",
+        message: "Supabase indisponível.",
         fixtures: [],
       });
     }
 
     try {
-      const response = await fetch("https://v3.football.api-sports.io/fixtures?league=1&season=2026", {
-        method: "GET",
-        headers: {
-          "x-apisports-key": footballApiKey,
-          "x-rapidapi-key": footballApiKey,
-        },
-      });
+      // Count World Cup 2026 matches in the table — UI uses this to decide
+      // whether to show "real data" badge or "simulated" badge.
+      const { count } = await supabase
+        .from("copabolao_matches")
+        .select("id", { count: "exact", head: true })
+        .like("id", "wc2026_%");
 
-      const data: any = await response.json();
-
-      if (data.errors && Object.keys(data.errors).length > 0) {
+      if (count && count > 0) {
         return res.json({
-          useRealData: false,
-          message: "API-Football retornou dados indisponíveis no momento.",
-          fixtures: [],
+          useRealData: true,
+          message: `${count} jogos da Copa do Mundo 2026 carregados.`,
+          fixtures: [], // client pulls fixtures from /api/db/sync
+          source: "openfootball",
         });
       }
 
-      const mapStatus = (apiStatus: string): "upcoming" | "live" | "completed" => {
-        const liveStatuses = ["1H", "HT", "2H", "ET", "BT", "P", "SUSP", "INT"];
-        const completedStatuses = ["FT", "AET", "PEN"];
-        if (liveStatuses.includes(apiStatus)) return "live";
-        if (completedStatuses.includes(apiStatus)) return "completed";
-        return "upcoming";
-      };
-
-      const mappedFixtures = (data.response || []).map((item: any) => ({
-        id: `real_${item.fixture.id}`,
-        homeTeam: {
-          name: item.teams.home.name,
-          code: item.teams.home.code || item.teams.home.name.substring(0, 3).toUpperCase(),
-          flagUrl: item.teams.home.logo || "⚽",
-        },
-        awayTeam: {
-          name: item.teams.away.name,
-          code: item.teams.away.code || item.teams.away.name.substring(0, 3).toUpperCase(),
-          flagUrl: item.teams.away.logo || "⚽",
-        },
-        date: item.fixture.date,
-        status: mapStatus(item.fixture.status.short),
-        league: (item.league.name === "World Cup" || item.league.name === "FIFA World Cup") ? "Copa do Mundo 2026" : item.league.name,
-        homeScore: item.goals.home !== null ? item.goals.home : undefined,
-        awayScore: item.goals.away !== null ? item.goals.away : undefined,
-        scorers: [],
-      }));
-
-      // Persist real matches to Supabase
-      const supabase = getSupabaseClient();
-      if (supabase && mappedFixtures.length > 0) {
-        try {
-          const mappedMatchesForSupabase = mappedFixtures.map((m: any) => ({
-            id: m.id,
-            home_team: m.homeTeam,
-            away_team: m.awayTeam,
-            date: m.date,
-            status: m.status,
-            home_score: m.homeScore !== undefined ? m.homeScore : null,
-            away_score: m.awayScore !== undefined ? m.awayScore : null,
-            scorers: m.scorers || [],
-            league: m.league,
-          }));
-          await supabase.from("copabolao_matches").upsert(mappedMatchesForSupabase);
-        } catch (dbErr: any) {
-          logError("football-fixtures-supabase", dbErr);
-        }
-      }
-
       return res.json({
-        useRealData: true,
-        fixtures: mappedFixtures,
+        useRealData: false,
+        message: "Calendário ainda não sincronizado. Admin pode rodar POST /api/football/sync.",
+        fixtures: [],
       });
     } catch (err: any) {
       logError("football-fixtures", err);
       return res.json({
         useRealData: false,
-        message: "Serviço de dados de futebol temporariamente indisponível.",
+        message: "Serviço temporariamente indisponível.",
         fixtures: [],
       });
     }
+  });
+
+  // REST API: Force a sync of the World Cup 2026 calendar from OpenFootball.
+  // Admin-only. Idempotent — safe to run repeatedly. Preserves any score/status
+  // already entered via the Simulator.
+  app.post("/api/football/sync", async (req, res) => {
+    const supabase = getSupabaseClient();
+    if (!supabase) return res.json({ success: false, message: "Sem Supabase." });
+
+    const authUser = await authenticateRequest(supabase, req.headers.authorization);
+    if (!authUser) {
+      return res.status(401).json({ success: false, message: "Autenticação necessária." });
+    }
+    if (!isAdminEmail(authUser.email)) {
+      return res.status(403).json({ success: false, message: "Apenas administradores podem sincronizar o calendário." });
+    }
+
+    console.warn(`[AUDIT] WORLD CUP SYNC initiated by admin: ${authUser.email}`);
+    const result = await syncWorldCupMatches(supabase);
+    return res.json({
+      success: !result.error,
+      synced: result.synced,
+      message: result.error || `${result.synced} jogos sincronizados.`,
+    });
   });
 
   // REST API: Sync database states with Supabase (race-condition protected via mutex)
@@ -1798,6 +1893,27 @@ Responda APENAS o JSON.`;
 
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`Server listening on port ${PORT}`);
+
+    // World Cup calendar sync — fire once at boot (cheap if already populated
+    // since we preserve existing scores/status), then every 6 hours.
+    // Async fire-and-forget; failures don't affect server health.
+    const supa = getSupabaseClient();
+    if (supa) {
+      syncWorldCupMatches(supa)
+        .then((r) => console.log(`[worldcup-sync] boot: ${r.synced} matches synced${r.error ? ` (error: ${r.error})` : ""}`))
+        .catch((e) => logError("worldcup-sync-boot", e));
+
+      // Run every 6h. Lighter touch than 1×/day so OpenFootball corrections
+      // (bumped kickoff times, knockout brackets after the round of 32) propagate
+      // within a few hours. Total external load: 4 fetches/day, ~50KB each.
+      setInterval(() => {
+        const s = getSupabaseClient();
+        if (!s) return;
+        syncWorldCupMatches(s)
+          .then((r) => console.log(`[worldcup-sync] interval: ${r.synced} matches synced`))
+          .catch((e) => logError("worldcup-sync-interval", e));
+      }, 6 * 60 * 60 * 1000);
+    }
   });
 }
 
