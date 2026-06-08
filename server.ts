@@ -692,7 +692,13 @@ Responda APENAS o JSON.`;
       if (tableName) {
         // Table-specific sync requests (polling helper)
         if (tableName === "copabolao_matches") {
-          const { data, error } = await supabase.from("copabolao_matches").select("*");
+          // Only World Cup 2026 matches are exposed. Legacy mock IDs (m1, m2, …),
+          // custom-match IDs from old features, or stale API-Football ids stay
+          // hidden from the client even if they're still in the table.
+          const { data, error } = await supabase
+            .from("copabolao_matches")
+            .select("*")
+            .like("id", "wc2026_%");
           if (error) return res.json({ success: false, error: "Erro ao consultar partidas." });
           const mappedMatches = (data || []).map((m: any) => ({
             id: m.id,
@@ -842,12 +848,13 @@ Responda APENAS o JSON.`;
         });
       }
 
-      // Already populated — fetch all collections in parallel
+      // Already populated — fetch all collections in parallel.
+      // Matches are filtered to wc2026_* only (see same filter in table-specific sync above).
       const [gRes, pRes, cRes, mRes] = await Promise.all([
         supabase.from("copabolao_groups").select("*"),
         supabase.from("copabolao_predictions").select("*"),
         supabase.from("copabolao_comments").select("*"),
-        supabase.from("copabolao_matches").select("*"),
+        supabase.from("copabolao_matches").select("*").like("id", "wc2026_%"),
       ]);
 
       const activeUsers = (users || []).filter((u: any) => u.deleted !== true);
@@ -957,26 +964,38 @@ Responda APENAS o JSON.`;
 
     await syncMutex.acquire();
     try {
-      // Wipe predictions (they're tied to specific match states we're about to overwrite).
+      // Wipe everything that ties admins to old data:
+      //   - All predictions (they referenced match states we're about to overwrite)
+      //   - All matches (legacy mocks m1..m8, custom_*, real_*, AND wc2026_* — start clean)
+      // Then re-pull the canonical World Cup calendar from OpenFootball. Groups,
+      // users, and comments are untouched.
       await supabase.from("copabolao_predictions").delete().neq("id", "_");
-
-      // Reset matches: replace the whole set with the initial seed.
-      // Groups, comments, users, and the public default group are NOT touched.
       await supabase.from("copabolao_matches").delete().neq("id", "_");
-      const mappedMatches = INITIAL_MATCHES.map((m) => ({
+
+      const result = await syncWorldCupMatches(supabase);
+      if (result.error) {
+        return res.json({ success: false, message: `Falha ao re-sincronizar calendário: ${result.error}` });
+      }
+
+      // Read back the freshly-inserted matches in the shape the client expects.
+      const { data: rows } = await supabase
+        .from("copabolao_matches")
+        .select("*")
+        .like("id", "wc2026_%");
+
+      const matches = (rows || []).map((m: any) => ({
         id: m.id,
-        home_team: m.homeTeam,
-        away_team: m.awayTeam,
+        homeTeam: m.home_team,
+        awayTeam: m.away_team,
         date: m.date,
         status: m.status,
-        home_score: m.homeScore !== undefined ? m.homeScore : null,
-        away_score: m.awayScore !== undefined ? m.awayScore : null,
+        homeScore: m.home_score !== null ? Number(m.home_score) : undefined,
+        awayScore: m.away_score !== null ? Number(m.away_score) : undefined,
         scorers: m.scorers || [],
         league: m.league,
       }));
-      await supabase.from("copabolao_matches").insert(mappedMatches);
 
-      return res.json({ success: true, matches: INITIAL_MATCHES });
+      return res.json({ success: true, matches, synced: result.synced });
     } catch (error: any) {
       logError("db-reset", error);
       return res.json({ success: false, message: "Erro ao resetar banco de dados." });
