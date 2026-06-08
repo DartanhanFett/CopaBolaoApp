@@ -66,6 +66,14 @@ export default function MatchList({
     if (filterTab === 'live') return match.status === 'live';
     if (filterTab === 'completed') return match.status === 'completed';
     return true;
+  })
+  .sort((a, b) => {
+    // Sort by kickoff date. Direction depends on which tab is active:
+    //   - upcoming/live → ascending: closest game first (most actionable on top)
+    //   - completed → descending: most recent finished match first
+    const ta = new Date(a.date).getTime();
+    const tb = new Date(b.date).getTime();
+    return filterTab === 'completed' ? tb - ta : ta - tb;
   });
 
   // Calculate unread items for active league/matches overall
