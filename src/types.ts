@@ -32,6 +32,9 @@ export interface User {
   avatar: string;
   email?: string;
   isAdmin?: boolean; // Set by the server on authentication
+  // IANA timezone string ("America/Sao_Paulo") or "auto" to follow the device.
+  // When undefined the UI falls back to "auto".
+  timezone?: string;
 }
 
 export interface CommentReaction {

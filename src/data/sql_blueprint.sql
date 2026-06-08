@@ -4,11 +4,15 @@
 -- Cole esse código lá e clique em "Run" (Executar).
 
 -- 1. Tabela de Usuários (copabolao_users)
+-- timezone: IANA tz string (e.g. "America/Sao_Paulo", "Asia/Shanghai") OR the
+-- literal "auto" meaning "use the browser/device's tz". Stored as text so users
+-- on VPN can override the auto-detected (often wrong) device tz.
 CREATE TABLE IF NOT EXISTS copabolao_users (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
     avatar TEXT NOT NULL,
     deleted BOOLEAN DEFAULT false NOT NULL,
+    timezone TEXT DEFAULT 'auto' NOT NULL,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL
 );
 
@@ -250,6 +254,7 @@ ON CONFLICT (id) DO NOTHING;
 -- Execute os comandos abaixo no SQL Editor do Supabase se você já possuía tabelas criadas:
 --
 -- ALTER TABLE copabolao_users ADD COLUMN IF NOT EXISTS deleted BOOLEAN DEFAULT false NOT NULL;
+-- ALTER TABLE copabolao_users ADD COLUMN IF NOT EXISTS timezone TEXT DEFAULT 'auto' NOT NULL;
 -- ALTER TABLE copabolao_groups ADD COLUMN IF NOT EXISTS deleted BOOLEAN DEFAULT false NOT NULL;
 -- ALTER TABLE copabolao_groups ADD COLUMN IF NOT EXISTS is_private BOOLEAN DEFAULT false NOT NULL;
 -- ALTER TABLE copabolao_predictions ADD COLUMN IF NOT EXISTS group_id TEXT;

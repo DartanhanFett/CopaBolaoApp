@@ -3,6 +3,7 @@ import { Play, RotateCcw, AlertTriangle, Zap, RefreshCw } from 'lucide-react';
 import { Match } from '../types';
 import { apiJson } from '../lib/api';
 import { toast } from 'react-hot-toast';
+import { formatMatchTimeCompact } from '../utils/time';
 
 interface SimulatorPanelProps {
   matches: Match[];
@@ -11,6 +12,8 @@ interface SimulatorPanelProps {
   onResetSimulator: () => void;
   isOpen: boolean;
   setIsOpen: (isOpen: boolean) => void;
+  // Admin's timezone preference, propagated from sessionUser. Defaults to "auto".
+  userTimezone?: string;
 }
 
 /**
@@ -22,10 +25,12 @@ function MatchRow({
   match,
   onSetMatchLive,
   onCompleteMatch,
+  userTimezone,
 }: {
   match: Match;
   onSetMatchLive: (matchId: string) => void;
   onCompleteMatch: (matchId: string, h: number, a: number) => void;
+  userTimezone: string;
 }) {
   const [home, setHome] = useState<number>(match.homeScore ?? 0);
   const [away, setAway] = useState<number>(match.awayScore ?? 0);
@@ -49,7 +54,7 @@ function MatchRow({
           )}
         </span>
         <span className="text-[10px] text-slate-500">
-          {new Date(match.date).toLocaleString('pt-BR', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' })}
+          {formatMatchTimeCompact(match.date, userTimezone)}
         </span>
       </div>
 
@@ -104,6 +109,7 @@ export default function SimulatorPanel({
   onSetMatchLive,
   onResetSimulator,
   isOpen,
+  userTimezone = 'auto',
 }: SimulatorPanelProps) {
   // Confirmation flag for the destructive reset action
   const [confirmingReset, setConfirmingReset] = useState(false);
@@ -168,6 +174,7 @@ export default function SimulatorPanel({
                 match={m}
                 onSetMatchLive={onSetMatchLive}
                 onCompleteMatch={onCompleteMatch}
+                userTimezone={userTimezone}
               />
             ))}
           </div>
@@ -187,6 +194,7 @@ export default function SimulatorPanel({
                 match={m}
                 onSetMatchLive={onSetMatchLive}
                 onCompleteMatch={onCompleteMatch}
+                userTimezone={userTimezone}
               />
             ))}
           </div>

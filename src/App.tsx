@@ -975,6 +975,7 @@ export default function App() {
               onResetSimulator={handleResetSimulator}
               isOpen={isSimulatorOpen}
               setIsOpen={setIsSimulatorOpen}
+              userTimezone={sessionUser?.timezone || 'auto'}
             />
           )}
         </AnimatePresence>
@@ -1252,6 +1253,7 @@ export default function App() {
                   return matchComments.some(c => new Date(c.timestamp).getTime() > new Date(lastReadTime).getTime());
                 }).map(m => m.id)}
                 onMarkAllCommentsAsRead={handleMarkAllCommentsAsRead}
+                userTimezone={sessionUser?.timezone || 'auto'}
               />
             ) : activeTab === 'ranking' ? (
               <Leaderboard
@@ -1264,11 +1266,16 @@ export default function App() {
             ) : (
               <UserProfile
                 currentUser={currentUser}
-                onUpdateProfile={(updatedName, updatedAvatar) => {
-                  const updatedUser = { ...currentUser, name: updatedName, avatar: updatedAvatar };
+                onUpdateProfile={(updatedName, updatedAvatar, updatedTimezone) => {
+                  const updatedUser = {
+                    ...currentUser,
+                    name: updatedName,
+                    avatar: updatedAvatar,
+                    ...(updatedTimezone !== undefined ? { timezone: updatedTimezone } : {}),
+                  };
                   setSessionUser(updatedUser);
                   localStorage.setItem('copabolao_session_user', JSON.stringify(updatedUser));
-                  
+
                   // Also update in users list so leaderboard/comments stay synced!
                   setUsers(prev => {
                     const next = prev.map(u => u.id === currentUser.id ? updatedUser : u);

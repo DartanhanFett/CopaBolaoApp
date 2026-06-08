@@ -66,6 +66,9 @@ const dbUsersUpsertBodySchema = z.object({
   id: z.string().min(1),
   name: z.string().min(1),
   avatar: z.string().min(1),
+  // Optional — IANA tz like "America/Sao_Paulo" or the literal "auto".
+  // When omitted, the server preserves whatever's already in the DB.
+  timezone: z.string().optional(),
 });
 
 const dbPredictionsUpsertBodySchema = z.object({
@@ -1342,6 +1345,8 @@ Responda APENAS o JSON.`;
           avatar: finalProfile.avatar,
           email: finalProfile.id,
           isAdmin: isAdminEmail(authUser.email),
+          // Default to "auto" if the column is missing (older DBs pre-migration).
+          timezone: finalProfile.timezone || "auto",
         },
       });
     } catch (err) {
@@ -1523,8 +1528,13 @@ Responda APENAS o JSON.`;
     }
 
     try {
-      const { id, name, avatar } = parsed.data;
-      const { error } = await supabase.from("copabolao_users").upsert({ id, name, avatar });
+      const { id, name, avatar, timezone } = parsed.data;
+      // Build the upsert object dynamically: only include `timezone` when the
+      // client actually sent one. Omitting it preserves the existing column
+      // value during regular profile-edit roundtrips.
+      const row: Record<string, any> = { id, name, avatar };
+      if (timezone !== undefined) row.timezone = timezone;
+      const { error } = await supabase.from("copabolao_users").upsert(row);
       if (error) {
         logError("db-users-upsert", error);
       }

@@ -1,12 +1,13 @@
 import React, { useState } from 'react';
-import { Camera, Shield, Award, Trophy, Key, LogOut, Check, ChevronRight, Coins, Zap, HelpCircle } from 'lucide-react';
+import { Camera, Shield, Award, Trophy, Key, LogOut, Check, ChevronRight, Coins, Zap, HelpCircle, Clock } from 'lucide-react';
 import { User, Prediction, Match, Group } from '../types';
 import { calculatePredictionPoints } from '../utils/rules';
 import { motion, AnimatePresence } from 'motion/react';
+import { TIMEZONE_OPTIONS, resolveTimezone } from '../utils/time';
 
 interface UserProfileProps {
   currentUser: User;
-  onUpdateProfile: (name: string, avatar: string) => void;
+  onUpdateProfile: (name: string, avatar: string, timezone?: string) => void;
   onLogout: () => void;
   onDeleteAccount?: () => void;
   predictions: Prediction[];
@@ -34,6 +35,7 @@ export default function UserProfile({
 }: UserProfileProps) {
   const [name, setName] = useState(currentUser.name);
   const [selectedAvatar, setSelectedAvatar] = useState(currentUser.avatar);
+  const [selectedTimezone, setSelectedTimezone] = useState<string>(currentUser.timezone || 'auto');
   const [isEditingAvatars, setIsEditingAvatars] = useState(false);
   const [saveIndicator, setSaveIndicator] = useState(false);
   const [showRules, setShowRules] = useState(false);
@@ -63,7 +65,7 @@ export default function UserProfile({
 
   const handleSave = () => {
     if (!name.trim()) return;
-    onUpdateProfile(name.trim(), selectedAvatar);
+    onUpdateProfile(name.trim(), selectedAvatar, selectedTimezone);
     setSaveIndicator(true);
     setTimeout(() => {
       setSaveIndicator(false);
@@ -149,6 +151,28 @@ export default function UserProfile({
               className="w-full px-3.6 py-2.2 bg-slate-950 border border-slate-800 focus:border-emerald-500 text-sm rounded-xl text-slate-100 outline-none transition font-semibold"
               placeholder="Digite seu nome ou apelido"
             />
+          </div>
+
+          {/* Timezone selector — useful for users on VPN where the device tz lies. */}
+          <div className="w-full space-y-1.5 pt-1">
+            <label className="block text-xs font-semibold text-slate-400 flex items-center gap-1.5">
+              <Clock className="w-3.5 h-3.5 text-slate-500" />
+              <span>Fuso horário dos jogos</span>
+            </label>
+            <select
+              value={selectedTimezone}
+              onChange={(e) => setSelectedTimezone(e.target.value)}
+              className="w-full px-3.6 py-2.2 bg-slate-950 border border-slate-800 focus:border-emerald-500 text-sm rounded-xl text-slate-100 outline-none transition"
+            >
+              {TIMEZONE_OPTIONS.map((opt) => (
+                <option key={opt.value} value={opt.value}>{opt.label}</option>
+              ))}
+            </select>
+            <p className="text-[10px] text-slate-500 leading-snug pt-1">
+              {selectedTimezone === 'auto'
+                ? `Detectado: ${resolveTimezone('auto')}. Se você usa VPN, escolha sua região acima.`
+                : `Mostrando horários em ${resolveTimezone(selectedTimezone)}.`}
+            </p>
           </div>
 
           {/* Actions line */}

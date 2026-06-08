@@ -5,6 +5,7 @@ import { isMatchLocked } from '../utils/rules';
 import { motion, AnimatePresence } from 'motion/react';
 import TeamCrest from './TeamCrest';
 import { apiJson } from '../lib/api';
+import { formatMatchTime } from '../utils/time';
 
 interface MatchListProps {
   matches: Match[];
@@ -18,6 +19,9 @@ interface MatchListProps {
   unreadMatchIds?: string[]; // list of match IDs with unread comments
   onMarkAllCommentsAsRead?: () => void;
   activeGroupId?: string;
+  // IANA tz string or "auto". Propagated from sessionUser so users on VPN see the
+  // timezone they actually configured in their profile. Defaults to "auto".
+  userTimezone?: string;
 }
 
 export default function MatchList({
@@ -32,6 +36,7 @@ export default function MatchList({
   unreadMatchIds = [],
   onMarkAllCommentsAsRead,
   activeGroupId,
+  userTimezone = 'auto',
 }: MatchListProps) {
   const [filterTab, setFilterTab] = useState<'upcoming' | 'live' | 'completed'>('upcoming');
   const [upcomingFilter, setUpcomingFilter] = useState<'all' | 'not_predicted' | 'predicted'>('all');
@@ -139,16 +144,9 @@ export default function MatchList({
     }
   };
 
-  const formatMatchTime = (isoString: string) => {
-    const date = new Date(isoString);
-    return date.toLocaleDateString('pt-BR', {
-      weekday: 'short',
-      month: 'short',
-      day: 'numeric',
-      hour: '2-digit',
-      minute: '2-digit',
-    });
-  };
+  // Local wrapper around formatMatchTime so we don't repeat `userTimezone` at
+  // every call site. Mirrors the original signature.
+  const fmtMatchTime = (isoString: string) => formatMatchTime(isoString, userTimezone);
 
   return (
     <div className="space-y-4">
@@ -336,7 +334,7 @@ export default function MatchList({
                 <div className="flex items-center justify-between text-xs mb-3 pb-2 border-b border-slate-850">
                   <span className="text-slate-400 font-medium flex items-center gap-1">
                     <Clock className="w-3.5 h-3.5 text-slate-500" />
-                    {formatMatchTime(match.date)}
+                    {fmtMatchTime(match.date)}
                   </span>
                   
                   {isLocked ? (
