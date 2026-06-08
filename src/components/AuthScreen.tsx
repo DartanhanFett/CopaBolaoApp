@@ -452,19 +452,20 @@ export default function AuthScreen({ onLoginSuccess }: AuthScreenProps) {
             </div>
           )}
 
-          {/* Social login. Google is wired through Supabase OAuth. Apple is parked
-              behind the paid Apple Developer Program — disabled until that's set up. */}
+          {/* Social login. Google goes through Supabase OAuth. We considered Apple
+              ID too but it requires the paid Apple Developer Program — pulled out
+              until that becomes worth it. */}
           <div className="my-5 flex items-center justify-between text-xs text-slate-500">
             <span className="border-b border-slate-800 w-1/4"></span>
             <span>ou continue com</span>
             <span className="border-b border-slate-800 w-1/4"></span>
           </div>
-          <div className="grid grid-cols-2 gap-3" id="auth-social">
+          <div id="auth-social">
             <button
               type="button"
               onClick={() => handleOAuthLogin('google')}
               disabled={isLoading}
-              className="py-2 px-3 bg-slate-950 hover:bg-slate-900 disabled:opacity-50 text-slate-200 hover:text-white border border-slate-800 hover:border-slate-700 rounded-xl text-xs font-bold flex items-center justify-center gap-2 transition active:scale-95"
+              className="w-full py-2.5 px-3 bg-slate-950 hover:bg-slate-900 disabled:opacity-50 text-slate-200 hover:text-white border border-slate-800 hover:border-slate-700 rounded-xl text-xs font-bold flex items-center justify-center gap-2 transition active:scale-95"
             >
               <svg className="w-4 h-4" viewBox="0 0 24 24" aria-hidden="true">
                 <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/>
@@ -472,14 +473,8 @@ export default function AuthScreen({ onLoginSuccess }: AuthScreenProps) {
                 <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/>
                 <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/>
               </svg>
-              <span>Google</span>
+              <span>Continuar com Google</span>
             </button>
-            <div
-              className="py-2 px-3 bg-slate-950 text-slate-600 border border-slate-800 rounded-xl text-xs font-bold flex items-center justify-center gap-2 opacity-50 cursor-not-allowed"
-              title="Apple ID requer conta paga de Apple Developer — em breve"
-            >
-              <span>Apple ID</span>
-            </div>
           </div>
         </motion.div>
 
