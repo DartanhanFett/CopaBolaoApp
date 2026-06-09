@@ -1,8 +1,9 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Send, MessageSquare, ChevronLeft, Heart, Flame, ShieldAlert } from 'lucide-react';
+import { Send, MessageSquare, ChevronLeft, Heart, Flame, ShieldAlert, Target } from 'lucide-react';
 import { Match, Comment, User, CommentReaction } from '../types';
 import { motion, AnimatePresence } from 'motion/react';
 import TeamCrest from './TeamCrest';
+import { parsePredictionMessage } from '../utils/predictionMessage';
 
 interface MatchCommentSectionProps {
   match: Match;
@@ -91,6 +92,11 @@ export default function MatchCommentSection({
           <AnimatePresence initial={false}>
             {comments.map((comment) => {
               const isMe = comment.userId === currentUser.id;
+              // Auto-posted prediction messages have a sentinel format. When parsed,
+              // we render a compact, badge-style bubble instead of a normal chat
+              // bubble — visually distinct so the timeline reads as a mix of
+              // "X palpitou Y x Z" + free-form chatter.
+              const prediction = parsePredictionMessage(comment.text);
               return (
                 <motion.div
                   key={comment.id}
@@ -120,16 +126,28 @@ export default function MatchCommentSection({
                     </span>
                   </div>
 
-                  {/* Comment bubble */}
-                  <div
-                    className={`p-3 rounded-2xl text-sm leading-relaxed ${
-                      isMe
-                        ? 'bg-gradient-to-r from-emerald-600 to-teal-700 text-white rounded-tr-none shadow-md shadow-emerald-950/20'
-                        : 'bg-slate-800 text-slate-100 rounded-tl-none shadow-md shadow-slate-950/40 border border-slate-700/50'
-                    }`}
-                  >
-                    {comment.text}
-                  </div>
+                  {/* Comment bubble — auto prediction vs human text */}
+                  {prediction ? (
+                    <div className="px-3 py-2 rounded-xl bg-amber-500/10 border border-amber-500/30 text-amber-300 flex items-center gap-2 shadow-inner">
+                      <Target className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                      <span className="text-[11px] uppercase tracking-wider font-bold opacity-80">
+                        Palpite
+                      </span>
+                      <span className="font-mono font-extrabold text-sm tracking-wide text-amber-200">
+                        {prediction.homeScore} <span className="text-amber-500/70">x</span> {prediction.awayScore}
+                      </span>
+                    </div>
+                  ) : (
+                    <div
+                      className={`p-3 rounded-2xl text-sm leading-relaxed ${
+                        isMe
+                          ? 'bg-gradient-to-r from-emerald-600 to-teal-700 text-white rounded-tr-none shadow-md shadow-emerald-950/20'
+                          : 'bg-slate-800 text-slate-100 rounded-tl-none shadow-md shadow-slate-950/40 border border-slate-700/50'
+                      }`}
+                    >
+                      {comment.text}
+                    </div>
+                  )}
 
                   {/* Reaction bar */}
                   <div className="flex flex-wrap items-center gap-1 mt-1">

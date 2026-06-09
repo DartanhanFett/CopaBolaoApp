@@ -423,9 +423,25 @@ export default function MatchList({
                   {/* Prediction inputs (only if not locked and not predicted yet) */}
                   {!isLocked ? (
                     myPred ? (
-                      <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 font-bold self-end text-xs shadow-inner">
-                        <Lock className="w-3.5 h-3.5 text-emerald-500" />
-                        <span>Confirmado! 🔒</span>
+                      // Already predicted but not yet locked: show "Confirmado" pill
+                      // AND let the user peek at what others guessed. This intentionally
+                      // mirrors the post-lock UX so anyone who already cast their pick
+                      // can see how the group is leaning, without giving last-to-pick
+                      // a free copy from those who haven't predicted yet.
+                      <div className="flex items-center gap-2 self-end">
+                        <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 font-bold text-xs shadow-inner">
+                          <Lock className="w-3.5 h-3.5 text-emerald-500" />
+                          <span>Confirmado! 🔒</span>
+                        </div>
+                        <button
+                          onClick={() => setExpandedPredictionsMatchId(
+                            expandedPredictionsMatchId === match.id ? null : match.id
+                          )}
+                          className="py-1.5 px-2 bg-slate-850 hover:bg-slate-800 text-slate-300 rounded-lg flex items-center gap-1 border border-slate-800 font-semibold transition text-xs"
+                        >
+                          <Eye className="w-3.5 h-3.5" />
+                          Ver Palpites
+                        </button>
                       </div>
                     ) : (
                       <div className="flex items-center gap-2 self-end">

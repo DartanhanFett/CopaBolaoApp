@@ -20,6 +20,7 @@ import WelcomeModal from './components/WelcomeModal';
 import { apiFetch, apiJson } from './lib/api';
 import { getSupabase } from '../lib/supabase/client';
 import { DEFAULT_GROUP } from './data/constants';
+import { encodePredictionMessage } from './utils/predictionMessage';
 
 const DEFAULT_GROUP_CODE = DEFAULT_GROUP.code;
 
@@ -572,6 +573,8 @@ export default function App() {
   // State actions
   const handleSavePrediction = (matchId: string, homeScore: number, awayScore: number) => {
     let targetPred: Prediction;
+    let isNewPrediction = false;
+
     setPredictions((prev) => {
       // Check if already exists for this user, match AND current group
       const existingIdx = prev.findIndex(
@@ -589,6 +592,7 @@ export default function App() {
         savePredictionToDb(targetPred);
         return copy;
       } else {
+        isNewPrediction = true;
         targetPred = {
           id: `pred_${activeGroupId}_${currentUser.id}_${matchId}`, // Composite ID unique per group, user & match
           userId: currentUser.id,
@@ -601,6 +605,29 @@ export default function App() {
         return [...prev, targetPred];
       }
     });
+
+    // Post a system-style chat message announcing the prediction. Only fire on
+    // first save (not on score edits) to avoid spam — if someone tweaks their
+    // pick, the row in "Ver Palpites do Grupo" already reflects it.
+    if (isNewPrediction && activeGroupId) {
+      const predictionMsg: Comment = {
+        id: `cpred_${activeGroupId}_${currentUser.id}_${matchId}`,
+        matchId,
+        userId: currentUser.id,
+        userName: currentUser.name,
+        userAvatar: currentUser.avatar,
+        text: encodePredictionMessage({ homeScore, awayScore, groupId: activeGroupId }),
+        timestamp: new Date().toISOString(),
+        reactions: [],
+      };
+      setComments((prev) => {
+        // Idempotency: if the same id already exists locally (e.g. quick double-click),
+        // don't duplicate. Server upsert handles the same case via primary key.
+        if (prev.some((c) => c.id === predictionMsg.id)) return prev;
+        return [...prev, predictionMsg];
+      });
+      saveCommentToDb(predictionMsg);
+    }
   };
 
   const handleAddComment = (matchId: string, text: string) => {
