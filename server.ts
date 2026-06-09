@@ -10,7 +10,7 @@ import cors from "cors";
 import rateLimit from "express-rate-limit";
 import { INITIAL_USERS, INITIAL_MATCHES, INITIAL_GROUPS, INITIAL_COMMENTS } from "./src/data/initialData";
 import { calculatePredictionPoints } from "./src/utils/rules";
-import { DEFAULT_GROUP } from "./src/data/constants";
+import { DEFAULT_GROUP, DEFAULT_GROUP_VISIBLE } from "./src/data/constants";
 import { mapTeam, teamFlagUrl } from "./src/data/teamMap";
 
 dotenv.config();
@@ -205,9 +205,15 @@ function isAdminEmail(email: string): boolean {
  * Called on first auth/me of any session — cheap (one-row select), so safe to run often.
  * If the row was wiped (manual cleanup, migration, accidental delete), this recreates it
  * without touching any other group's data.
+ *
+ * Honors the DEFAULT_GROUP_VISIBLE kill switch: when the flag is off, we leave
+ * whatever state the row is in (including soft-deleted) alone. Without this guard,
+ * an admin marking the group as deleted in Supabase would see it auto-resurrect
+ * on the very next login.
  */
 async function ensureDefaultGroup(supabase: any): Promise<void> {
   if (!supabase) return;
+  if (!DEFAULT_GROUP_VISIBLE) return;
   try {
     const { data: existing } = await supabase
       .from("copabolao_groups")
