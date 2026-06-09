@@ -96,6 +96,9 @@ const dbGroupsUpsertBodySchema = z.object({
 const dbCommentsUpsertBodySchema = z.object({
   id: z.string().min(1),
   matchId: z.string().min(1),
+  // Scopes the comment to a bolão. Optional during the migration window —
+  // older clients may still POST without it.
+  groupId: z.string().nullable().optional(),
   userId: z.string().min(1),
   userName: z.string().min(1),
   userAvatar: z.string().min(1),
@@ -760,6 +763,7 @@ Responda APENAS o JSON.`;
           const mappedComments = (data || []).map((c: any) => ({
             id: c.id,
             matchId: c.match_id,
+            groupId: c.group_id ?? null,
             userId: c.user_id,
             userName: c.user_name,
             userAvatar: c.user_avatar,
@@ -889,6 +893,7 @@ Responda APENAS o JSON.`;
       const mappedComments = (cRes.data || []).map((c: any) => ({
         id: c.id,
         matchId: c.match_id,
+        groupId: c.group_id ?? null,
         userId: c.user_id,
         userName: c.user_name,
         userAvatar: c.user_avatar,
@@ -1689,11 +1694,15 @@ Responda APENAS o JSON.`;
       return res.status(403).json({ success: false, message: "Você só pode modificar seus próprios comentários." });
     }
 
-    const { id, matchId, userId, userName, userAvatar, text, timestamp, reactions } = parsed.data;
+    const { id, matchId, groupId, userId, userName, userAvatar, text, timestamp, reactions } = parsed.data;
     try {
-      const { error } = await supabase.from("copabolao_comments").upsert({
+      // Persist with the optional group_id. Falling back to a fresh upsert without
+      // the column lets the server keep working even if the migration ALTER TABLE
+      // hasn't been applied yet (column-not-found error → retry without groupId).
+      let { error } = await supabase.from("copabolao_comments").upsert({
         id,
         match_id: matchId,
+        group_id: groupId ?? null,
         user_id: userId,
         user_name: userName,
         user_avatar: userAvatar,
@@ -1701,6 +1710,21 @@ Responda APENAS o JSON.`;
         timestamp,
         reactions,
       });
+
+      if (error && error.message?.includes("group_id")) {
+        console.warn("Coluna 'group_id' ausente em copabolao_comments. Salvando sem a coluna.");
+        const fallback = await supabase.from("copabolao_comments").upsert({
+          id,
+          match_id: matchId,
+          user_id: userId,
+          user_name: userName,
+          user_avatar: userAvatar,
+          text,
+          timestamp,
+          reactions,
+        });
+        error = fallback.error;
+      }
       if (error) logError("db-comments-upsert", error);
       return res.json({ success: !error });
     } catch (error: any) {

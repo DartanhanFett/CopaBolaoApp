@@ -58,9 +58,14 @@ CREATE TABLE IF NOT EXISTS copabolao_predictions (
 );
 
 -- 5. Tabela de Comentários / Chats (copabolao_comments)
+-- group_id: agrupa o chat por bolão. Sem isso, comentários "vazam" entre bolões
+-- diferentes que compartilham a mesma partida. NULL é permitido para preservar
+-- comentários legados (criados antes da migração); o cliente trata NULL como
+-- "comentário antigo, mostra em qualquer bolão" para não desaparecer histórico.
 CREATE TABLE IF NOT EXISTS copabolao_comments (
     id TEXT PRIMARY KEY,
     match_id TEXT NOT NULL,
+    group_id TEXT,
     user_id TEXT REFERENCES copabolao_users(id) ON DELETE CASCADE,
     user_name TEXT NOT NULL,
     user_avatar TEXT NOT NULL,
@@ -72,6 +77,7 @@ CREATE TABLE IF NOT EXISTS copabolao_comments (
 
 -- Criar índices de performance para consultas frequentes
 CREATE INDEX IF NOT EXISTS idx_comments_match ON copabolao_comments(match_id);
+CREATE INDEX IF NOT EXISTS idx_comments_match_group ON copabolao_comments(match_id, group_id);
 CREATE INDEX IF NOT EXISTS idx_predictions_user ON copabolao_predictions(user_id);
 CREATE INDEX IF NOT EXISTS idx_predictions_match ON copabolao_predictions(match_id);
 CREATE INDEX IF NOT EXISTS idx_predictions_group ON copabolao_predictions(group_id);
@@ -255,6 +261,8 @@ ON CONFLICT (id) DO NOTHING;
 --
 -- ALTER TABLE copabolao_users ADD COLUMN IF NOT EXISTS deleted BOOLEAN DEFAULT false NOT NULL;
 -- ALTER TABLE copabolao_users ADD COLUMN IF NOT EXISTS timezone TEXT DEFAULT 'auto' NOT NULL;
+-- ALTER TABLE copabolao_comments ADD COLUMN IF NOT EXISTS group_id TEXT;
+-- CREATE INDEX IF NOT EXISTS idx_comments_match_group ON copabolao_comments(match_id, group_id);
 -- ALTER TABLE copabolao_groups ADD COLUMN IF NOT EXISTS deleted BOOLEAN DEFAULT false NOT NULL;
 -- ALTER TABLE copabolao_groups ADD COLUMN IF NOT EXISTS is_private BOOLEAN DEFAULT false NOT NULL;
 -- ALTER TABLE copabolao_predictions ADD COLUMN IF NOT EXISTS group_id TEXT;

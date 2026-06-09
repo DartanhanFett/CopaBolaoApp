@@ -3,7 +3,7 @@ import { Users, Plus, Star, Award, TrendingUp, Sparkles, Copy, Check, Share2, Co
 import { Group, User } from '../types';
 import { motion } from 'motion/react';
 import { toast } from 'react-hot-toast';
-import { DEFAULT_GROUP } from '../data/constants';
+import { DEFAULT_GROUP, DEFAULT_GROUP_VISIBLE } from '../data/constants';
 
 interface GroupListProps {
   groups: Group[];
@@ -39,10 +39,16 @@ export default function GroupList({
   const joinedGroups = groups.filter((g) => g.members.includes(currentUserId));
 
   // 2. Public Explore Groups: groups that are public and current user is NOT a member.
-  // The official default group is always pinned first when present, so newcomers find it
-  // without scrolling through community-created public bolões.
+  // The official default group is pinned first when visible, so newcomers find it
+  // without scrolling through community-created public bolões. When the kill switch
+  // DEFAULT_GROUP_VISIBLE is off, we strip it from the list entirely (existing
+  // members keep their membership; this only hides the discoverability surface).
   const publicExploreGroups = groups
-    .filter((g) => !g.members.includes(currentUserId) && g.isPrivate !== true)
+    .filter((g) => {
+      if (g.members.includes(currentUserId) || g.isPrivate === true) return false;
+      if (!DEFAULT_GROUP_VISIBLE && g.id === DEFAULT_GROUP.id) return false;
+      return true;
+    })
     .sort((a, b) => {
       if (a.id === DEFAULT_GROUP.id) return -1;
       if (b.id === DEFAULT_GROUP.id) return 1;

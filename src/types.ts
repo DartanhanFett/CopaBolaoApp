@@ -46,6 +46,10 @@ export interface CommentReaction {
 export interface Comment {
   id: string;
   matchId: string;
+  // Scopes the comment to a specific bolão. Optional because legacy rows
+  // (created before the scoping feature) come back as null and are shown in
+  // every group as a "shared past" — we don't want to lose chat history.
+  groupId?: string | null;
   userId: string;
   userName: string;
   userAvatar: string;

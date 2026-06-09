@@ -14,3 +14,18 @@ export const DEFAULT_GROUP = {
   league: 'Copa do Mundo 2026',
   code: 'COPA2026',
 } as const;
+
+/**
+ * Master switch that hides the public default group from the UI:
+ *   - it disappears from the "Explorar Públicos" tab
+ *   - the welcome modal that offered to join it stops showing
+ *
+ * The group itself is NOT deleted from the database — existing members keep
+ * their membership and chat/predictions stay intact. Flip back to `true` to
+ * re-enable everything without any migration.
+ *
+ * Reason for the kill switch: during the demo phase, brand-new users were
+ * accidentally landing on Geral instead of the friend-invited bolão they came
+ * from, and chat there was confusing the friends/family WhatsApp groups.
+ */
+export const DEFAULT_GROUP_VISIBLE = false;

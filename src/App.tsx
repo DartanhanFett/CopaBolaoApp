@@ -19,7 +19,7 @@ import UserProfile from './components/UserProfile';
 import WelcomeModal from './components/WelcomeModal';
 import { apiFetch, apiJson } from './lib/api';
 import { getSupabase } from '../lib/supabase/client';
-import { DEFAULT_GROUP } from './data/constants';
+import { DEFAULT_GROUP, DEFAULT_GROUP_VISIBLE } from './data/constants';
 import { encodePredictionMessage } from './utils/predictionMessage';
 
 const DEFAULT_GROUP_CODE = DEFAULT_GROUP.code;
@@ -455,8 +455,11 @@ export default function App() {
   // Suppress the "join the public Geral" modal whenever there's a pending invite —
   // the friend's invite card is far more relevant for someone who arrived via link,
   // and stacking both makes the UX confusing.
+  // Also suppress it entirely when the public default group is disabled
+  // (DEFAULT_GROUP_VISIBLE = false). See constants.ts for the rationale.
   const showWelcomeModal =
-    !!sessionUser
+    DEFAULT_GROUP_VISIBLE
+    && !!sessionUser
     && isFirstSyncDone
     && userGroupCount === 0
     && !welcomeAlreadyDismissed
@@ -613,6 +616,9 @@ export default function App() {
       const predictionMsg: Comment = {
         id: `cpred_${activeGroupId}_${currentUser.id}_${matchId}`,
         matchId,
+        // Same scoping rule as human comments — keeps prediction announcements
+        // inside the bolão they were posted from.
+        groupId: activeGroupId,
         userId: currentUser.id,
         userName: currentUser.name,
         userAvatar: currentUser.avatar,
@@ -634,6 +640,11 @@ export default function App() {
     const newComment: Comment = {
       id: `c_${Date.now()}`,
       matchId,
+      // Scope to the active bolão so the chat doesn't bleed into other groups
+      // that share the same match (e.g. World Cup 2026 fixtures appear in every
+      // bolão of that league). Null only happens if a user somehow opens chat
+      // without a selected group — defensive default.
+      groupId: activeGroupId ?? null,
       userId: currentUser.id,
       userName: currentUser.name,
       userAvatar: currentUser.avatar,
@@ -1290,7 +1301,13 @@ export default function App() {
                 groupMembers={activeGroup?.members}
                 activeGroupId={activeGroupId}
                 unreadMatchIds={matches.filter(m => {
-                  const matchComments = comments.filter(c => c.matchId === m.id);
+                  // Same group-scoping rule used everywhere chat is shown:
+                  // include legacy comments where groupId is null/undefined
+                  // (those predate the migration and shouldn't disappear).
+                  const matchComments = comments.filter(c =>
+                    c.matchId === m.id
+                    && (!c.groupId || c.groupId === activeGroupId)
+                  );
                   if (matchComments.length === 0) return false;
                   const lastReadTime = lastOpenedCommentsAt[m.id];
                   if (!lastReadTime) return true;
@@ -1355,7 +1372,13 @@ export default function App() {
           >
             <MatchCommentSection
               match={activeMatchForComments}
-              comments={comments.filter((c) => c.matchId === activeMatchForComments.id)}
+              comments={comments.filter((c) =>
+                c.matchId === activeMatchForComments.id
+                // Group-scope chat: only show messages tagged with this bolão's id.
+                // Legacy rows (groupId null/undefined, pre-migration) appear in every
+                // group as a shared past — we don't want to hide chat history.
+                && (!c.groupId || c.groupId === activeGroupId)
+              )}
               currentUser={currentUser}
               onAddComment={handleAddComment}
               onToggleReaction={handleToggleReaction}
@@ -1484,8 +1507,12 @@ export default function App() {
         setActiveTab={setActiveTab}
         hasUnreadComments={matches.some(m => {
           if (activeGroup && m.league !== activeGroup.league) return false;
-          
-          const matchComments = comments.filter(c => c.matchId === m.id);
+
+          // Group-scoped unread badge — same rule as the per-match unread filter above.
+          const matchComments = comments.filter(c =>
+            c.matchId === m.id
+            && (!c.groupId || c.groupId === activeGroupId)
+          );
           if (matchComments.length === 0) return false;
           const lastReadTime = lastOpenedCommentsAt[m.id];
           if (!lastReadTime) return true;
