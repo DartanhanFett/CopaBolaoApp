@@ -401,17 +401,26 @@ export default function App() {
   }, [sessionUser]);
 
   // Invite & Sharing States
+  // Read the invite code from the URL on first mount, with a localStorage fallback.
+  // The fallback matters because OAuth providers (Google, magic link) round-trip the
+  // browser through their own domains and can strip query params. AuthScreen mirrors
+  // the code to localStorage right before kicking off the sign-in flow.
   const [pendingInviteCode, setPendingInviteCode] = useState<string | null>(() => {
     try {
       const params = new URLSearchParams(window.location.search);
-      const code = params.get('invite');
-      return code ? code.trim().toUpperCase() : null;
+      const fromUrl = params.get('invite');
+      if (fromUrl) return fromUrl.trim().toUpperCase();
+      const fromStorage = localStorage.getItem('copabolao_pending_invite');
+      return fromStorage ? fromStorage.trim().toUpperCase() : null;
     } catch {
       return null;
     }
   });
   const [copiedActiveCode, setCopiedActiveCode] = useState(false);
 
+  // Strips the invite code from both the URL bar and the localStorage fallback.
+  // Called once the invite flow finishes (accepted, declined, or invalid) so it
+  // doesn't keep haunting future sessions on the same browser.
   const clearInviteQueryParam = () => {
     try {
       const url = new URL(window.location.href);
@@ -420,6 +429,7 @@ export default function App() {
     } catch (e) {
       console.error("Erro ao limpar convite da URL:", e);
     }
+    try { localStorage.removeItem('copabolao_pending_invite'); } catch {}
   };
 
   // Modals state
@@ -441,8 +451,15 @@ export default function App() {
     : 0;
   const welcomeAlreadyDismissed =
     !!welcomeDismissedKey && localStorage.getItem(welcomeDismissedKey) === '1';
+  // Suppress the "join the public Geral" modal whenever there's a pending invite —
+  // the friend's invite card is far more relevant for someone who arrived via link,
+  // and stacking both makes the UX confusing.
   const showWelcomeModal =
-    !!sessionUser && isFirstSyncDone && userGroupCount === 0 && !welcomeAlreadyDismissed;
+    !!sessionUser
+    && isFirstSyncDone
+    && userGroupCount === 0
+    && !welcomeAlreadyDismissed
+    && !pendingInviteCode;
 
   const handleWelcomeAccept = async () => {
     setIsWelcomeJoining(true);

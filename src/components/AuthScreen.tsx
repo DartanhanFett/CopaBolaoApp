@@ -66,11 +66,22 @@ export default function AuthScreen({ onLoginSuccess }: AuthScreenProps) {
       // Real Supabase OTP — token arrives by email.
       // emailRedirectTo points the magic link back to the current page so it works
       // even if the user clicks the link instead of typing the 6-digit code.
+      // Preserve ?invite=XYZ through the round-trip (and stash a copy in
+      // localStorage as a belt-and-suspenders fallback). Without this, a friend
+      // clicking your invite link and signing up loses the invite when they hit
+      // their email.
+      const inviteCode = new URLSearchParams(window.location.search).get('invite');
+      if (inviteCode) {
+        try { localStorage.setItem('copabolao_pending_invite', inviteCode); } catch {}
+      }
+      const redirectUrl = inviteCode
+        ? `${window.location.origin}/?invite=${encodeURIComponent(inviteCode)}`
+        : window.location.origin;
       const { error } = await supabase.auth.signInWithOtp({
         email: trimmedEmail,
         options: {
           shouldCreateUser: isSignUp,
-          emailRedirectTo: window.location.origin,
+          emailRedirectTo: redirectUrl,
         },
       });
       if (error) {
@@ -101,9 +112,21 @@ export default function AuthScreen({ onLoginSuccess }: AuthScreenProps) {
     }
     setIsLoading(true);
     try {
+      // Preserve any in-flight invite code through the OAuth round-trip. Without
+      // this, signing in via Google strips ?invite=XYZ from the URL and the user
+      // lands on a "no groups" page even when they came from a friend's invite link.
+      // Belt-and-suspenders: also stash in localStorage in case Google rewrites the URL.
+      const inviteCode = new URLSearchParams(window.location.search).get('invite');
+      if (inviteCode) {
+        try { localStorage.setItem('copabolao_pending_invite', inviteCode); } catch {}
+      }
+      const redirectUrl = inviteCode
+        ? `${window.location.origin}/?invite=${encodeURIComponent(inviteCode)}`
+        : window.location.origin;
+
       const { error } = await supabase.auth.signInWithOAuth({
         provider,
-        options: { redirectTo: window.location.origin },
+        options: { redirectTo: redirectUrl },
       });
       if (error) {
         const msg = error.message?.toLowerCase().includes('provider')
