@@ -576,23 +576,50 @@ Instruções para o "reasoning":
 
 Responda APENAS o JSON.`;
 
-      const modelName = process.env.GEMINI_MODEL || "gemini-2.5-flash";
-      const response = await ai.models.generateContent({
-        model: modelName,
-        contents: prompt,
-        config: {
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              homeScore: { type: Type.INTEGER, description: "Gols do mandante" },
-              awayScore: { type: Type.INTEGER, description: "Gols do visitante" },
-              reasoning: { type: Type.STRING, description: "Comentário curto e divertido" },
+      // Try the configured model first; fall back to gemini-1.5-flash on errors
+      // that smell like model availability problems. 1.5-flash is broadly available
+      // on the free tier; 2.5-flash isn't always — and the error spelling varies
+      // across SDK versions.
+      const primaryModel = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+      const fallbackModel = "gemini-1.5-flash";
+
+      const callModel = async (modelName: string) => {
+        return ai.models.generateContent({
+          model: modelName,
+          contents: prompt,
+          config: {
+            responseMimeType: "application/json",
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                homeScore: { type: Type.INTEGER, description: "Gols do mandante" },
+                awayScore: { type: Type.INTEGER, description: "Gols do visitante" },
+                reasoning: { type: Type.STRING, description: "Comentário curto e divertido" },
+              },
+              required: ["homeScore", "awayScore", "reasoning"],
             },
-            required: ["homeScore", "awayScore", "reasoning"],
           },
-        },
-      });
+        });
+      };
+
+      let response: Awaited<ReturnType<typeof callModel>>;
+      try {
+        response = await callModel(primaryModel);
+      } catch (primaryErr: any) {
+        const msg = String(primaryErr?.message || "").toLowerCase();
+        const looksLikeModelIssue =
+          msg.includes("not found")
+          || msg.includes("not supported")
+          || msg.includes("not available")
+          || msg.includes("invalid_argument")
+          || msg.includes("404");
+        if (primaryModel !== fallbackModel && looksLikeModelIssue) {
+          logError("ai-suggest-score-primary-failed", primaryErr);
+          response = await callModel(fallbackModel);
+        } else {
+          throw primaryErr;
+        }
+      }
 
       const responseText = response.text || "{}";
       const parsedAi = JSON.parse(responseText.trim());
@@ -605,10 +632,18 @@ Responda APENAS o JSON.`;
       });
     } catch (e: any) {
       logError("ai-suggest-score", e);
+      // Reuse the same canned pool as the no-key fallback — picking randomly so
+      // a quota outage doesn't show literally identical text on every request.
+      const errorFallbacks = [
+        `Clássico equilibrado! ${homeTeam} e ${awayTeam} vão se estudar. Empate disputado ou vitória magra.`,
+        `${homeTeam} vem ofensivo, ${awayTeam} sabe jogar fechado. Jogo de transições rápidas.`,
+        `Jogo travado no meio-campo. Decisão na bola parada ou contra-ataque.`,
+        `Confronto de zebra possível! ${awayTeam} pode surpreender se entrar ligado.`,
+      ];
       return res.json({
-        homeScore: 1,
-        awayScore: 1,
-        reasoning: "Jogo travado, aposto num 1x1 de segurança.",
+        homeScore: Math.floor(Math.random() * 4),
+        awayScore: Math.floor(Math.random() * 4),
+        reasoning: errorFallbacks[Math.floor(Math.random() * errorFallbacks.length)],
         isAiGenerated: false,
       });
     }
