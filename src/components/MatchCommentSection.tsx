@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Send, MessageSquare, ChevronLeft, Heart, Flame, ShieldAlert, Target } from 'lucide-react';
+import { Send, MessageSquare, ChevronLeft, Heart, Flame, ShieldAlert, Target, ChevronDown } from 'lucide-react';
 import { Match, Comment, User, CommentReaction } from '../types';
 import { motion, AnimatePresence } from 'motion/react';
 import TeamCrest from './TeamCrest';
@@ -30,11 +30,56 @@ export default function MatchCommentSection({
   // null = nothing open; otherwise = comment id.
   const [reactionPopoverFor, setReactionPopoverFor] = useState<string | null>(null);
   const commentsEndRef = useRef<HTMLDivElement>(null);
+  // Scrollable container — we attach the listener here, not on window, because
+  // the chat is rendered inside a modal that scrolls independently.
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
+  // True while the user is reading older messages — when set, we suppress the
+  // auto-scroll-to-bottom on each new comment. Otherwise tapping a reaction or
+  // scrolling up to re-read context yanks the view back to the latest line.
+  const [hasUnreadBelow, setHasUnreadBelow] = useState(false);
 
-  // Auto-scroll to bottom when comments list updates
+  // Within this many pixels of the bottom counts as "the user is reading the
+  // tail" and we keep auto-scrolling on new messages. Outside it, we hold
+  // position and surface the "↓ nova mensagem" button instead. 96px ≈ one
+  // chat bubble + padding — enough to absorb the new-row layout shift.
+  const BOTTOM_STICKY_THRESHOLD_PX = 96;
+
+  const isNearBottom = (el: HTMLElement): boolean => {
+    return el.scrollHeight - el.scrollTop - el.clientHeight < BOTTOM_STICKY_THRESHOLD_PX;
+  };
+
+  const scrollToBottom = (smooth = true) => {
+    commentsEndRef.current?.scrollIntoView({ behavior: smooth ? 'smooth' : 'auto' });
+    setHasUnreadBelow(false);
+  };
+
+  // Auto-scroll only when the user is already near the bottom. Otherwise: leave
+  // their scroll position alone and flip the "new message below" hint on.
   useEffect(() => {
-    commentsEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    const el = scrollContainerRef.current;
+    if (!el) return;
+    if (isNearBottom(el)) {
+      // Use 'auto' (instant) on update so a flurry of incoming chats doesn't
+      // turn into a smooth-scroll storm. Smooth is reserved for the user's
+      // own click on the ↓ pill.
+      commentsEndRef.current?.scrollIntoView({ behavior: 'auto' });
+      setHasUnreadBelow(false);
+    } else {
+      setHasUnreadBelow(true);
+    }
   }, [comments]);
+
+  // Clear the "unread below" hint as soon as the user scrolls down to the tail
+  // on their own. Without this the pill would stay visible forever once shown.
+  useEffect(() => {
+    const el = scrollContainerRef.current;
+    if (!el) return;
+    const onScroll = () => {
+      if (isNearBottom(el)) setHasUnreadBelow(false);
+    };
+    el.addEventListener('scroll', onScroll, { passive: true });
+    return () => el.removeEventListener('scroll', onScroll);
+  }, []);
 
   // Close the reaction popover when the user taps anywhere outside it.
   // Without this, opening one and tapping another would leave both visually
@@ -59,7 +104,7 @@ export default function MatchCommentSection({
   };
 
   return (
-    <div className="flex flex-col h-full bg-slate-950 text-slate-100 rounded-2xl overflow-hidden border border-slate-800 shadow-2xl">
+    <div className="flex flex-col h-full bg-slate-950 text-slate-100 rounded-2xl overflow-hidden border border-slate-800 shadow-2xl relative">
       {/* Target header */}
       <div className="flex items-center justify-between px-4 py-3 bg-slate-900 border-b border-slate-800">
         <button
@@ -100,7 +145,10 @@ export default function MatchCommentSection({
       </div>
 
       {/* Comments List */}
-      <div className="flex-1 overflow-y-auto p-4 space-y-4 scrollbar-thin scrollbar-thumb-slate-800 scrollbar-track-transparent">
+      <div
+        ref={scrollContainerRef}
+        className="flex-1 overflow-y-auto p-4 space-y-4 scrollbar-thin scrollbar-thumb-slate-800 scrollbar-track-transparent relative"
+      >
         {comments.length === 0 ? (
           <div className="h-full flex flex-col items-center justify-center p-8 text-center space-y-2">
             <MessageSquare className="w-10 h-10 text-slate-600 animate-bounce" />
@@ -244,6 +292,27 @@ export default function MatchCommentSection({
         )}
         <div ref={commentsEndRef} />
       </div>
+
+      {/* Floating "new message" pill — appears when a chat arrives while the
+          user is reading older messages. Tapping snaps to bottom (smooth) and
+          dismisses the pill. Anchored to the bottom of the chat region so it
+          sits just above the input field. */}
+      <AnimatePresence>
+        {hasUnreadBelow && (
+          <motion.button
+            type="button"
+            initial={{ opacity: 0, y: 8 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: 8 }}
+            transition={{ duration: 0.15 }}
+            onClick={() => scrollToBottom(true)}
+            className="absolute bottom-20 left-1/2 -translate-x-1/2 z-30 flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-emerald-500 text-slate-950 text-xs font-bold shadow-xl active:scale-95"
+          >
+            <ChevronDown className="w-3.5 h-3.5" />
+            <span>Nova mensagem</span>
+          </motion.button>
+        )}
+      </AnimatePresence>
 
       {/* Input section */}
       <form

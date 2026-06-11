@@ -1062,12 +1062,40 @@ export default function App() {
   // badge clears on the next render.
   useEffect(() => {
     if (activeTab !== 'news') return;
+    // Don't auto-mark-as-read while the tab is hidden (user opened the news tab,
+    // then switched to another browser tab/window). The original logic only
+    // checked activeTab === 'news', so events that arrived while the user was
+    // away — but still on the news tab in our SPA — were silently swallowed
+    // and the unread badge never appeared once they came back.
+    if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return;
+
     const t = setTimeout(() => {
+      // Re-check at fire-time too — between scheduling and firing the user
+      // may have switched tabs.
+      if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return;
       const now = new Date().toISOString();
       setNewsLastReadAt(now);
       try { localStorage.setItem('copabolao_news_last_read', now); } catch {}
     }, 1500);
-    return () => clearTimeout(t);
+
+    // If the user comes back from a hidden tab while still on /news, re-run the
+    // effect so the timer schedules from "now" instead of being missed.
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        clearTimeout(t);
+        // Mark immediately on return — they were already on the news tab; no
+        // need to wait another 1.5s.
+        const now = new Date().toISOString();
+        setNewsLastReadAt(now);
+        try { localStorage.setItem('copabolao_news_last_read', now); } catch {}
+      }
+    };
+    document.addEventListener('visibilitychange', onVisibility);
+
+    return () => {
+      clearTimeout(t);
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
   }, [activeTab]);
 
   // Per-match unread comment counts, scoped to the active bolão. Computed once
@@ -1127,6 +1155,18 @@ export default function App() {
   // the comments list arrives all at once — we don't want to spam a flood of
   // "new comment" notifications for messages that are days old.
   const notificationsBootstrappedRef = useRef(false);
+
+  // Re-bootstrap whenever the user switches bolão. Without this, switching
+  // from bolão A to bolão B would pre-seed the seen-set with A's comments,
+  // and then every backfill comment that arrives for B (e.g. older messages
+  // streamed in by /api/db/sync) would fire a desktop notification — the
+  // user opens bolão B and gets a flood of buzzes for chat that's days old.
+  // Re-bootstrap = "treat whatever comments are loaded *right now* as
+  // already-seen, only fire on actual deltas after this point".
+  useEffect(() => {
+    notificationsBootstrappedRef.current = false;
+    seenCommentIdsRef.current = new Set();
+  }, [activeGroupId]);
 
   useEffect(() => {
     if (!sessionUser) return;
