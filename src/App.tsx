@@ -1218,6 +1218,98 @@ export default function App() {
     return () => window.removeEventListener("copabolao:open-match-chat", onOpen);
   }, [matches]);
 
+  // --- Pre-betlock palpite reminders ---
+  //
+  // For each upcoming match in the active bolão the user hasn't palpitated on
+  // yet, schedule a single in-tab Notification ~30 minutes before kickoff (≈15
+  // minutes before bet-lock — enough time to actually drop a guess). Caveats:
+  //
+  //   - Pure setTimeout: works only while the tab is alive (foreground or
+  //     background). No service worker / no FCM, so a closed laptop doesn't
+  //     receive these. Closed-tab push is a separate, larger project.
+  //   - Idempotent per (matchId, kickoffMs): we keep a Set of "already fired
+  //     reminders" so re-renders or re-syncs don't double-buzz.
+  //   - Re-checks state at fire time and skips if the user palpitated in the
+  //     meantime, even on a different device (the predictions sync would have
+  //     pulled the row in).
+  const firedReminderKeysRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    if (!sessionUser || !activeGroupId) return;
+    // We fire the in-app toast unconditionally — even users who never granted
+    // browser-notification permission get the reminder while the tab is open.
+    // The system Notification call inside the timeout self-gates on permission
+    // + visibility; failing both just means "in-app toast only", which is
+    // exactly what we want.
+
+    // Window: kickoff − 30min .. kickoff (anything older than that is past
+    // bet-lock anyway — palpite window already closed).
+    const REMINDER_MS_BEFORE_KICKOFF = 30 * 60 * 1000;
+    const now = Date.now();
+    const horizon = now + 24 * 60 * 60 * 1000; // 24h ahead — keep timer count tiny
+
+    const candidates = matches.filter((m) => {
+      if (m.status !== 'upcoming') return false;
+      if (activeGroup && m.league !== activeGroup.league) return false;
+      const kickoff = new Date(m.date).getTime();
+      if (!Number.isFinite(kickoff)) return false;
+      const reminderAt = kickoff - REMINDER_MS_BEFORE_KICKOFF;
+      // Skip if reminder fire time is in the past (we'd just buzz immediately
+      // for a match that's already kicking off / locked) or too far ahead.
+      return reminderAt > now && reminderAt < horizon;
+    });
+
+    const timers: ReturnType<typeof setTimeout>[] = [];
+    for (const match of candidates) {
+      const kickoff = new Date(match.date).getTime();
+      const reminderAt = kickoff - REMINDER_MS_BEFORE_KICKOFF;
+      const key = `${match.id}@${kickoff}`;
+      if (firedReminderKeysRef.current.has(key)) continue;
+
+      // If the user already palpitated in this bolão, no reminder needed.
+      const alreadyPalpitated = predictions.some(
+        (p) => p.matchId === match.id && p.userId === currentUser.id && p.groupId === activeGroupId,
+      );
+      if (alreadyPalpitated) continue;
+
+      const t = setTimeout(() => {
+        // Re-validate at fire time — predictions may have synced, the user may
+        // have switched bolão, the match may have changed status.
+        if (firedReminderKeysRef.current.has(key)) return;
+        firedReminderKeysRef.current.add(key);
+
+        const stillUpcoming = matches.find((m) => m.id === match.id)?.status === 'upcoming';
+        if (!stillUpcoming) return;
+        const stillUnpredicted = !predictions.some(
+          (p) => p.matchId === match.id && p.userId === currentUser.id && p.groupId === activeGroupId,
+        );
+        if (!stillUnpredicted) return;
+
+        const matchLabel = `${match.homeTeam.name} x ${match.awayTeam.name}`;
+        // Always surface the in-app toast — for users with the app open this
+        // is the entire reminder, and for hidden tabs we ALSO call the
+        // system Notification helper (it self-gates on visibility).
+        toast(`⏰ ${matchLabel} começa em 30 min — palpite ainda em aberto!`, {
+          duration: 8000,
+          icon: '⚽',
+        });
+        showNotification({
+          title: '⏰ Palpite quase fechando',
+          body: `${matchLabel} começa em 30 min — ainda não tem seu palpite.`,
+          matchId: match.id,
+          // Different tag from comment notifications so a buzzy match chat
+          // doesn't replace the reminder and vice versa.
+          tag: `betlock:${match.id}`,
+        });
+      }, reminderAt - now);
+
+      timers.push(t);
+    }
+
+    return () => {
+      for (const t of timers) clearTimeout(t);
+    };
+  }, [matches, predictions, activeGroupId, activeGroup, sessionUser, currentUser.id]);
+
   if (!authChecked) {
     // Brief splash while we figure out who is logged in
     return (
