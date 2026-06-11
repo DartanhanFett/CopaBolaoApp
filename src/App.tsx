@@ -6,7 +6,6 @@ import { Toaster, toast } from 'react-hot-toast';
 // Data and components
 import { INITIAL_USERS, INITIAL_MATCHES, INITIAL_GROUPS, INITIAL_COMMENTS } from './data/initialData';
 import { INITIAL_PREDICTIONS } from './data/initialPredictions';
-import { Group, Match, Prediction, User, Comment } from './types';
 import BottomNav from './components/BottomNav';
 import GroupList from './components/GroupList';
 import MatchList from './components/MatchList';
@@ -17,6 +16,8 @@ import SimulatorPanel from './components/SimulatorPanel';
 import AuthScreen from './components/AuthScreen';
 import UserProfile from './components/UserProfile';
 import WelcomeModal from './components/WelcomeModal';
+import NewsTab from './components/NewsTab';
+import { Group, Match, Prediction, User, Comment, AppEvent } from './types';
 import { apiFetch, apiJson } from './lib/api';
 import { getSupabase } from '../lib/supabase/client';
 import { DEFAULT_GROUP, DEFAULT_GROUP_VISIBLE } from './data/constants';
@@ -70,6 +71,19 @@ export default function App() {
   const [comments, setComments] = useState<Comment[]>(() => {
     const saved = localStorage.getItem('copabolao_comments');
     return saved ? JSON.parse(saved) : INITIAL_COMMENTS;
+  });
+
+  // Activity feed state. Server populates copabolao_events via /api/db/sync;
+  // we mirror it here for rendering and to drive the unread-news badge.
+  const [appEvents, setAppEvents] = useState<AppEvent[]>([]);
+  // Per-user last-read timestamp for the news tab. localStorage only — no need
+  // to round-trip Supabase for something this ephemeral.
+  const [newsLastReadAt, setNewsLastReadAt] = useState<string | null>(() => {
+    try {
+      return localStorage.getItem('copabolao_news_last_read') || null;
+    } catch {
+      return null;
+    }
   });
 
   // Real Football API Integration states
@@ -266,7 +280,7 @@ export default function App() {
   };
 
   // Active navigation states
-  const [activeTab, setActiveTab] = useState<'groups' | 'matches' | 'ranking' | 'profile'>('groups');
+  const [activeTab, setActiveTab] = useState<'groups' | 'matches' | 'ranking' | 'profile' | 'news'>('groups');
   const [activeGroupId, setActiveGroupId] = useState<string | null>('g1'); // Default to Amigos da Copa to show dynamic live feel instantly!
   const [showGroupDeleteModal, setShowGroupDeleteModal] = useState(false);
   const [showGroupLeaveModal, setShowGroupLeaveModal] = useState(false);
@@ -329,12 +343,13 @@ export default function App() {
   const syncData = async (silent = true) => {
     try {
       if (!silent) setIsSyncing(true);
-      const [matchesRes, usersRes, predictionsRes, commentsRes, groupsRes] = await Promise.all([
+      const [matchesRes, usersRes, predictionsRes, commentsRes, groupsRes, eventsRes] = await Promise.all([
         apiJson<any>("/api/db/sync?table=copabolao_matches"),
         apiJson<any>("/api/db/sync?table=copabolao_users"),
         apiJson<any>("/api/db/sync?table=copabolao_predictions"),
         apiJson<any>("/api/db/sync?table=copabolao_comments"),
         apiJson<any>("/api/db/sync?table=copabolao_groups"),
+        apiJson<any>("/api/db/sync?table=copabolao_events"),
       ]);
 
       // Merge instead of replacing — keeps local-only records (custom matches, optimistic
@@ -356,6 +371,12 @@ export default function App() {
       }
       if (groupsRes.success) {
         setGroups((prev) => mergeById(prev, groupsRes.data || []));
+      }
+      if (eventsRes && eventsRes.success) {
+        // Events are append-only — newer ones replace older with the same id.
+        // Merging preserves any optimistically-added local entries (none today
+        // but cheap insurance for future writes).
+        setAppEvents((prev) => mergeById(prev, eventsRes.data || []));
       }
 
       if (!silent) toast.success("Sincronizado com os servidores!");
@@ -934,6 +955,21 @@ export default function App() {
     }
   }, []);
 
+  // Auto-mark the news tab as read once it's been visible for a moment. We
+  // wait a beat (rather than firing immediately on tab change) so that someone
+  // who taps the tab and bounces away by mistake still sees their unread badge
+  // when they come back. If they actually stay, the timestamp updates and the
+  // badge clears on the next render.
+  useEffect(() => {
+    if (activeTab !== 'news') return;
+    const t = setTimeout(() => {
+      const now = new Date().toISOString();
+      setNewsLastReadAt(now);
+      try { localStorage.setItem('copabolao_news_last_read', now); } catch {}
+    }, 1500);
+    return () => clearTimeout(t);
+  }, [activeTab]);
+
   // Per-match unread comment counts, scoped to the active bolão. Computed once
   // here and threaded into MatchList + BottomNav so badges show "3" instead of
   // a generic "•". Legacy comments without a groupId stay visible everywhere
@@ -974,6 +1010,22 @@ export default function App() {
     }
     return sum;
   }, [matches, unreadByMatch, activeGroup]);
+
+  // Unread events for the news tab. Same scoping rule as the NewsTab itself:
+  // events from the active bolão (or globally-scoped) that arrived after the
+  // last time the user opened the tab.
+  const unreadNewsCount = useMemo(() => {
+    const lastReadMs = newsLastReadAt ? new Date(newsLastReadAt).getTime() : 0;
+    let count = 0;
+    for (const e of appEvents) {
+      // Skip events the user themselves caused — your own action shouldn't
+      // ping you. Also skip events from other bolões.
+      if (e.actorId === currentUser.id) continue;
+      if (activeGroup && e.groupId && e.groupId !== activeGroup.id) continue;
+      if (new Date(e.createdAt).getTime() > lastReadMs) count++;
+    }
+    return count;
+  }, [appEvents, newsLastReadAt, activeGroup, currentUser.id]);
 
   // Track which comment IDs we've already shown / seen, so we don't re-notify
   // for the same comment on every re-render. Ref instead of state because we
@@ -1417,6 +1469,14 @@ export default function App() {
                 users={users}
                 currentUserId={currentUser.id}
               />
+            ) : activeTab === 'news' ? (
+              <NewsTab
+                events={appEvents}
+                users={users}
+                activeGroup={activeGroup}
+                currentUserId={currentUser.id}
+                lastReadAt={newsLastReadAt}
+              />
             ) : (
               <UserProfile
                 currentUser={currentUser}
@@ -1599,6 +1659,7 @@ export default function App() {
         activeTab={activeTab}
         setActiveTab={setActiveTab}
         unreadCommentsCount={totalUnread}
+        unreadNewsCount={unreadNewsCount}
       />
     </div>
   );

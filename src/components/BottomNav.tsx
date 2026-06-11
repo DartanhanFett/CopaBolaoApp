@@ -1,45 +1,54 @@
 import React from 'react';
-import { Users, Trophy, Flame, User } from 'lucide-react';
+import { Users, Trophy, Flame, User, Bell } from 'lucide-react';
 import { motion } from 'motion/react';
 
 interface BottomNavProps {
-  activeTab: 'groups' | 'matches' | 'ranking' | 'profile';
-  setActiveTab: (tab: 'groups' | 'matches' | 'ranking' | 'profile') => void;
+  activeTab: 'groups' | 'matches' | 'ranking' | 'profile' | 'news';
+  setActiveTab: (tab: 'groups' | 'matches' | 'ranking' | 'profile' | 'news') => void;
   /** Total unread comments across the active bolão. Drives the numeric badge on
    *  both the "Jogos" and "Meus Bolões" tabs. 0 hides the badge. */
   unreadCommentsCount?: number;
+  /** Total unread feed events. Same idea but on the Novidades tab. */
+  unreadNewsCount?: number;
 }
 
-export default function BottomNav({ activeTab, setActiveTab, unreadCommentsCount = 0 }: BottomNavProps) {
+export default function BottomNav({
+  activeTab,
+  setActiveTab,
+  unreadCommentsCount = 0,
+  unreadNewsCount = 0,
+}: BottomNavProps) {
   const tabs = [
-    { id: 'groups', label: 'Meus Bolões', icon: Users },
+    { id: 'groups', label: 'Bolões', icon: Users },
     { id: 'matches', label: 'Jogos', icon: Flame },
+    { id: 'news', label: 'Novidades', icon: Bell },
     { id: 'ranking', label: 'Ranking', icon: Trophy },
-    { id: 'profile', label: 'Meu Perfil', icon: User },
+    { id: 'profile', label: 'Perfil', icon: User },
   ] as const;
 
-  // Show the unread badge on whichever tab the user is NOT currently on, so it
-  // serves as a real "go check this" cue. Showing it on the active tab would
-  // be noise — they're already there.
-  const showBadgeOn = (id: string) => {
-    if (unreadCommentsCount <= 0) return false;
-    if (id === activeTab) return false;
-    return id === 'matches' || id === 'groups';
+  // Show a numeric badge on whichever tab the user is NOT currently on. The
+  // active tab is hidden because they're already there — badge would be noise.
+  const badgeCountFor = (id: string): number => {
+    if (id === activeTab) return 0;
+    if (id === 'matches' || id === 'groups') return unreadCommentsCount;
+    if (id === 'news') return unreadNewsCount;
+    return 0;
   };
 
   return (
     <nav className="fixed bottom-0 left-0 right-0 z-50 bg-slate-900/95 backdrop-blur-md border-t border-slate-800 pb-safe shadow-xl">
-      <div className="max-w-md mx-auto px-4 h-16 flex items-center justify-around">
+      <div className="max-w-md mx-auto px-2 h-16 flex items-center justify-around">
         {tabs.map((tab) => {
           const Icon = tab.icon;
           const isActive = activeTab === tab.id;
-          const showBadge = showBadgeOn(tab.id);
+          const badgeCount = badgeCountFor(tab.id);
+          const showBadge = badgeCount > 0;
 
           return (
             <button
               key={tab.id}
               onClick={() => setActiveTab(tab.id)}
-              className="relative flex flex-col items-center justify-center py-1 px-3 text-xs font-medium transition-colors focus:outline-none"
+              className="relative flex flex-col items-center justify-center py-1 px-2 text-[10px] font-medium transition-colors focus:outline-none flex-1"
               style={{ WebkitTapHighlightColor: 'transparent' }}
             >
               {isActive && (
@@ -58,12 +67,9 @@ export default function BottomNav({ activeTab, setActiveTab, unreadCommentsCount
                   }`}
                 />
                 {showBadge && (
-                  // Numeric pill anchored to the icon's top-right. Capped at "9+"
-                  // so it never grows wider than the tab cell. min-w keeps the
-                  // single-digit "1" / "9" the same width as "9+" so the icon
-                  // doesn't shift around as the count changes.
+                  // Numeric pill anchored to the icon's top-right, capped at "9+".
                   <span className="absolute -top-1.5 -right-2.5 min-w-[18px] h-[18px] px-1 bg-rose-500 text-slate-50 text-[9px] font-extrabold rounded-full border border-slate-900 leading-none flex items-center justify-center animate-pulse">
-                    {unreadCommentsCount > 9 ? '9+' : unreadCommentsCount}
+                    {badgeCount > 9 ? '9+' : badgeCount}
                   </span>
                 )}
               </div>

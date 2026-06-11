@@ -31,6 +31,7 @@ const dbSyncQuerySchema = z.object({
     "copabolao_groups",
     "copabolao_predictions",
     "copabolao_comments",
+    "copabolao_events",
   ]).optional(),
 });
 
@@ -169,6 +170,74 @@ function logError(context: string, err: unknown): void {
     message = String(err);
   }
   console.error(`[${context}] ${message}`);
+}
+
+/**
+ * Persists an activity-feed event row. Fire-and-forget on purpose — we don't
+ * want a transient Supabase error in the events table to break the underlying
+ * action (e.g. a comment shouldn't fail just because we couldn't log "X
+ * comentou em Y"). Errors get logged for diagnostics, that's it.
+ *
+ * Idempotency: callers that may retry (e.g. the sync loop flipping matches to
+ * completed) must pass an `id` deterministic enough to dedupe. Otherwise we
+ * generate a random one. The DB has no UNIQUE on (type, …) so the dedup is
+ * caller's responsibility.
+ */
+async function logEvent(
+  supabase: any,
+  evt: {
+    id?: string;
+    type: string;
+    groupId?: string | null;
+    actorId?: string | null;
+    targetId?: string | null;
+    matchId?: string | null;
+    payload?: Record<string, any>;
+  },
+): Promise<void> {
+  if (!supabase) return;
+  try {
+    const { error } = await supabase.from("copabolao_events").upsert({
+      id: evt.id || `evt_${Math.random().toString(36).slice(2, 12)}_${Math.random().toString(36).slice(2, 8)}`,
+      type: evt.type,
+      group_id: evt.groupId ?? null,
+      actor_id: evt.actorId ?? null,
+      target_id: evt.targetId ?? null,
+      match_id: evt.matchId ?? null,
+      payload: evt.payload ?? {},
+    });
+    if (error) {
+      // Treat "table doesn't exist yet" gracefully — the migration may not have
+      // been applied. Don't spam the log with the same error every request.
+      const msg = String(error.message || "").toLowerCase();
+      if (!msg.includes("does not exist") && !msg.includes("relation")) {
+        logError("log-event", error);
+      }
+    }
+  } catch (err) {
+    logError("log-event", err);
+  }
+}
+
+/**
+ * Reads "Home x Away" label for a match id. Used by event emitters to give the
+ * client-side UI a ready-to-render string without duplicating the team-name
+ * lookup logic. Returns "" when the match is missing — caller falls back to
+ * a generic "um jogo" phrase via the message catalog.
+ */
+async function fetchMatchLabel(supabase: any, matchId: string): Promise<string> {
+  if (!supabase || !matchId) return "";
+  try {
+    const { data } = await supabase
+      .from("copabolao_matches")
+      .select("home_team, away_team")
+      .eq("id", matchId)
+      .maybeSingle();
+    if (!data) return "";
+    return `${data.home_team?.name || "?"} x ${data.away_team?.name || "?"}`;
+  } catch {
+    return "";
+  }
 }
 
 // ─── Auth Middleware ────────────────────────────────────────────────────────
@@ -415,7 +484,25 @@ async function syncWorldCupMatches(supabase: any): Promise<{ synced: number; err
     // Rescore predictions for each newly-completed match. Sequential (not parallel)
     // because there are typically 0-2 newly-completed matches per sync — no need
     // to fan out, and serializing keeps Supabase load predictable.
+    // Also emits feed events: one match.completed per match, plus per-prediction
+    // rank.exact / rank.zeroed events surfaced from the rescore output.
     for (const id of newlyCompletedIds) {
+      const upserted = upserts.find((u) => u.id === id);
+      const matchLabel = upserted
+        ? `${upserted.home_team.name} x ${upserted.away_team.name}`
+        : "";
+      const score =
+        upserted && upserted.home_score !== null && upserted.away_score !== null
+          ? `${upserted.home_score} x ${upserted.away_score}`
+          : "";
+
+      await logEvent(supabase, {
+        id: `e_done_${id}`,
+        type: "match.completed",
+        matchId: id,
+        payload: { matchLabel, score },
+      });
+
       const result = await rescoreMatch(supabase, id);
       if (result.error) {
         logError("worldcup-sync-rescore", `${id}: ${result.error}`);
@@ -441,6 +528,15 @@ async function syncWorldCupMatches(supabase: any): Promise<{ synced: number; err
  * Idempotent: re-scoring an already-scored match just rewrites the same
  * points_earned values, so racing calls between the cron and a manual click
  * don't corrupt anything.
+ *
+ * Side effect: emits feed events to copabolao_events:
+ *   - rank.exact   for each user who hit the exact score
+ *   - rank.zeroed  for each user who finished the match with 0 pts
+ *   - rank.passed  for each pair (A, B) where A overtook B per group
+ *   - rank.podium  when a user enters the top 3 of a group for the first
+ *                  time as a result of this rescore
+ * The diff is computed by snapshotting per-group standings before/after
+ * the upsert. Only ranks that actually moved generate events.
  */
 async function rescoreMatch(supabase: any, matchId: string): Promise<{ scored: number; error?: string }> {
   try {
@@ -463,6 +559,19 @@ async function rescoreMatch(supabase: any, matchId: string): Promise<{ scored: n
       scorers: matchRow.scorers || [],
       league: matchRow.league,
     };
+    const matchLabel = `${matchRow.home_team?.name || "?"} x ${matchRow.away_team?.name || "?"}`;
+    const matchScore =
+      match.homeScore !== undefined && match.awayScore !== undefined
+        ? `${match.homeScore} x ${match.awayScore}`
+        : "";
+
+    // Snapshot pre-state. Pull every prediction ever (we need cross-match totals,
+    // not just this match) and bucket by (group_id, user_id) → totalPoints.
+    // Eats a bit more bandwidth than strictly needed but keeps the math obvious.
+    const { data: allPredsBefore } = await supabase
+      .from("copabolao_predictions")
+      .select("user_id, group_id, points_earned");
+    const standingsBefore = computeStandings(allPredsBefore || []);
 
     const { data: predRows, error: predErr } = await supabase
       .from("copabolao_predictions")
@@ -490,10 +599,137 @@ async function rescoreMatch(supabase: any, matchId: string): Promise<{ scored: n
       const { error: upsertErr } = await supabase.from("copabolao_predictions").upsert(updates);
       if (upsertErr) return { scored: 0, error: upsertErr.message };
     }
+
+    // Per-prediction events: exact score / zero. We log even when the user is
+    // alone in the bolão — solo player still likes to see "PLACAR EXATO!".
+    for (const u of updates) {
+      if (u.points_earned === 5) {
+        await logEvent(supabase, {
+          id: `e_exact_${u.id}`,
+          type: "rank.exact",
+          groupId: u.group_id || null,
+          actorId: u.user_id,
+          matchId,
+          payload: { matchLabel, score: matchScore },
+        });
+      } else if (u.points_earned === 0) {
+        await logEvent(supabase, {
+          id: `e_zero_${u.id}`,
+          type: "rank.zeroed",
+          groupId: u.group_id || null,
+          actorId: u.user_id,
+          matchId,
+          payload: { matchLabel, score: matchScore },
+        });
+      }
+    }
+
+    // Snapshot post-state and emit ranking-shuffle events. We only consider
+    // groups that actually had predictions for this match — other groups didn't
+    // change. For each such group, compare the ordered ranking pre vs post:
+    //  - rank.passed: any (winner, loser) pair where winner is now ABOVE loser
+    //    but was BELOW them in the pre-snapshot.
+    //  - rank.podium: any user who is now in top 3 but wasn't before.
+    const { data: allPredsAfter } = await supabase
+      .from("copabolao_predictions")
+      .select("user_id, group_id, points_earned");
+    const standingsAfter = computeStandings(allPredsAfter || []);
+
+    const affectedGroups = new Set<string>();
+    for (const u of updates) {
+      if (u.group_id) affectedGroups.add(u.group_id);
+    }
+
+    for (const groupId of affectedGroups) {
+      const before = rankUsers(standingsBefore.get(groupId) || new Map());
+      const after = rankUsers(standingsAfter.get(groupId) || new Map());
+
+      // Index user → position for both. Only look at users who appear in both
+      // (a brand-new prediction-by-someone-just-joining gets no comparison).
+      const posBefore = new Map<string, number>();
+      before.forEach((u, i) => posBefore.set(u, i));
+      const posAfter = new Map<string, number>();
+      after.forEach((u, i) => posAfter.set(u, i));
+
+      // Detect passes: pairs where A is now above B but was below B before.
+      // This naturally captures "A passed B" — the pair where A moved up past B.
+      for (const [user, posA] of posAfter.entries()) {
+        const beforeA = posBefore.get(user);
+        if (beforeA === undefined) continue;
+        if (posA >= beforeA) continue; // didn't move up
+        // Walk only the immediate user A passed (not the whole list, to avoid spam).
+        for (const [other, posB] of posAfter.entries()) {
+          if (other === user) continue;
+          const beforeB = posBefore.get(other);
+          if (beforeB === undefined) continue;
+          // Was below other before, now above. The dedupe id includes the match
+          // so a re-rescore of the same match doesn't double-log the same pass.
+          if (posA < posB && beforeA > beforeB) {
+            await logEvent(supabase, {
+              id: `e_pass_${matchId}_${groupId}_${user}_${other}`,
+              type: "rank.passed",
+              groupId,
+              actorId: user,
+              targetId: other,
+              matchId,
+              payload: {
+                fromPos: beforeA + 1,
+                toPos: posA + 1,
+              },
+            });
+          }
+        }
+
+        // Podium entry: now top 3, wasn't before.
+        if (posA < 3 && beforeA >= 3) {
+          await logEvent(supabase, {
+            id: `e_podium_${matchId}_${groupId}_${user}`,
+            type: "rank.podium",
+            groupId,
+            actorId: user,
+            matchId,
+            payload: { position: posA + 1 },
+          });
+        }
+      }
+    }
+
     return { scored: updates.length };
   } catch (err: any) {
     return { scored: 0, error: err?.message || "unknown" };
   }
+}
+
+/**
+ * Reduces a flat list of prediction rows into Map<groupId, Map<userId, totalPoints>>.
+ * Predictions with null group_id are bucketed under "" so they still produce
+ * a ranking — same convention used elsewhere for legacy un-scoped predictions.
+ */
+function computeStandings(predRows: any[]): Map<string, Map<string, number>> {
+  const out = new Map<string, Map<string, number>>();
+  for (const p of predRows) {
+    const gid = p.group_id || "";
+    const uid = p.user_id;
+    const pts = Number(p.points_earned ?? 0);
+    if (!out.has(gid)) out.set(gid, new Map());
+    const inner = out.get(gid)!;
+    inner.set(uid, (inner.get(uid) || 0) + pts);
+  }
+  return out;
+}
+
+/**
+ * Sorts users in a single-group standings map descending by points and returns
+ * a stable ordered list of userIds. Ties broken by userId for determinism so
+ * the diff between snapshots doesn't oscillate on equal scores.
+ */
+function rankUsers(standings: Map<string, number>): string[] {
+  return Array.from(standings.entries())
+    .sort((a, b) => {
+      if (b[1] !== a[1]) return b[1] - a[1];
+      return a[0].localeCompare(b[0]);
+    })
+    .map(([uid]) => uid);
 }
 
 // ─── Sync Mutex ────────────────────────────────────────────────────────────
@@ -975,6 +1211,37 @@ Responda APENAS o JSON.`;
             reactions: c.reactions || [],
           }));
           return res.json({ success: true, data: mappedComments });
+        }
+        if (tableName === "copabolao_events") {
+          // Cap at the last 200 events. Activity feed is ephemeral by nature
+          // — older stuff stops being interesting fast. Keeps the response
+          // payload small enough that mobile clients on slow connections
+          // don't choke on every Realtime tick.
+          const { data, error } = await supabase
+            .from("copabolao_events")
+            .select("*")
+            .order("created_at", { ascending: false })
+            .limit(200);
+          if (error) {
+            // Tolerate "table doesn't exist" — happens when migration hasn't
+            // been applied yet. UI just shows empty feed in that case.
+            const msg = String(error.message || "").toLowerCase();
+            if (msg.includes("does not exist") || msg.includes("relation")) {
+              return res.json({ success: true, data: [] });
+            }
+            return res.json({ success: false, error: "Erro ao consultar eventos." });
+          }
+          const mapped = (data || []).map((e: any) => ({
+            id: e.id,
+            type: e.type,
+            groupId: e.group_id ?? null,
+            actorId: e.actor_id ?? null,
+            targetId: e.target_id ?? null,
+            matchId: e.match_id ?? null,
+            payload: e.payload || {},
+            createdAt: e.created_at,
+          }));
+          return res.json({ success: true, data: mapped });
         }
         return res.json({ success: false, error: "Tabela inválida." });
       }
@@ -1614,6 +1881,16 @@ Responda APENAS o JSON.`;
         return res.json({ success: false, message: "Erro ao atualizar membros." });
       }
 
+      // Feed event: someone joined this bolão. Idempotent on (group, user) so
+      // a re-join after a leave logs only once per (group, user).
+      await logEvent(supabase, {
+        id: `e_join_${group.id}_${authUser.email}`,
+        type: "group.member.joined",
+        groupId: group.id,
+        actorId: authUser.email,
+        payload: { groupName: group.name },
+      });
+
       return res.json({ success: true, group: updated });
     } catch (err) {
       logError("groups-join", err);
@@ -1872,6 +2149,39 @@ Responda APENAS o JSON.`;
         error = fallback.error;
       }
       if (error) logError("db-comments-upsert", error);
+
+      // Emit a feed event so the activity tab picks this up. We distinguish
+      // human comments from auto-posted prediction announcements by sniffing
+      // the prefix used in src/utils/predictionMessage.ts. Idempotent ID per
+      // comment so duplicate upserts (e.g. quick double-tap) don't double-log.
+      if (!error) {
+        const isPredictionMsg = text.startsWith("__prediction__:");
+        if (isPredictionMsg) {
+          // Format: __prediction__:HxA:groupId
+          const m = text.match(/^__prediction__:(\d+)x(\d+):/);
+          const score = m ? `${m[1]} x ${m[2]}` : "";
+          const matchLabel = await fetchMatchLabel(supabase, matchId);
+          await logEvent(supabase, {
+            id: `e_pred_${id}`,
+            type: "prediction.new",
+            groupId: groupId ?? null,
+            actorId: userId,
+            matchId,
+            payload: { matchLabel, score },
+          });
+        } else {
+          const matchLabel = await fetchMatchLabel(supabase, matchId);
+          await logEvent(supabase, {
+            id: `e_cmt_${id}`,
+            type: "comment.new",
+            groupId: groupId ?? null,
+            actorId: userId,
+            matchId,
+            payload: { matchLabel, preview: text.slice(0, 80) },
+          });
+        }
+      }
+
       return res.json({ success: !error });
     } catch (error: any) {
       logError("db-comments", error);
@@ -1900,6 +2210,16 @@ Responda APENAS o JSON.`;
 
     const { id, homeTeam, awayTeam, date, status, homeScore, awayScore, scorers, league } = parsed.data;
     try {
+      // Read prior status so we can emit a feed event only on transitions
+      // (upcoming → live, upcoming/live → completed). Avoids logging dozens of
+      // duplicate "match started" events when admin tweaks the score live.
+      const { data: prior } = await supabase
+        .from("copabolao_matches")
+        .select("status")
+        .eq("id", id)
+        .maybeSingle();
+      const priorStatus = prior?.status;
+
       const { error } = await supabase.from("copabolao_matches").upsert({
         id,
         home_team: homeTeam,
@@ -1912,6 +2232,26 @@ Responda APENAS o JSON.`;
         league,
       });
       if (error) logError("db-matches-upsert", error);
+
+      if (!error) {
+        const matchLabel = `${homeTeam.name} x ${awayTeam.name}`;
+        if (status === "live" && priorStatus !== "live") {
+          await logEvent(supabase, {
+            id: `e_live_${id}`,
+            type: "match.live",
+            matchId: id,
+            payload: { matchLabel },
+          });
+        } else if (status === "completed" && priorStatus !== "completed") {
+          await logEvent(supabase, {
+            id: `e_done_${id}`,
+            type: "match.completed",
+            matchId: id,
+            payload: { matchLabel, score: `${homeScore ?? 0} x ${awayScore ?? 0}` },
+          });
+        }
+      }
+
       return res.json({ success: !error });
     } catch (error: any) {
       logError("db-matches", error);

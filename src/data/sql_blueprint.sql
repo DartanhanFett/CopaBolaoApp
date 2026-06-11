@@ -75,12 +75,35 @@ CREATE TABLE IF NOT EXISTS copabolao_comments (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL
 );
 
+-- 6. Tabela de Eventos / Atividades (copabolao_events)
+-- Feed central de "novidades" do app. Cada ação relevante (comentário, palpite,
+-- jogo encerrado, novo membro, mudança no ranking) gera uma linha aqui. O
+-- cliente mostra na aba "🔔 Novidades" rotacionando frases zueiras a partir
+-- do `type` + `payload`.
+--
+-- Designed para growth + retention: feed denso vira chamariz pra abrir o app.
+-- TTL implícito de 30 dias é aplicado pelo client (filtrar created_at recente);
+-- não há trigger de purge ainda — pra demo da Copa o volume cabe em qualquer
+-- plano free do Supabase.
+CREATE TABLE IF NOT EXISTS copabolao_events (
+    id TEXT PRIMARY KEY,
+    type TEXT NOT NULL,                  -- 'comment.new', 'match.live', 'match.completed', 'rank.passed', etc.
+    group_id TEXT,                       -- bolão de origem; NULL para eventos globais
+    actor_id TEXT,                       -- quem fez a ação (email do usuário, NULL para eventos do sistema)
+    target_id TEXT,                      -- quem foi afetado (ranking ultrapassado, etc.); pode coincidir com actor
+    match_id TEXT,                       -- jogo associado quando aplicável
+    payload JSONB DEFAULT '{}'::jsonb,   -- dados extras: texto do comentário, placar, posições etc.
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL
+);
+
 -- Criar índices de performance para consultas frequentes
 CREATE INDEX IF NOT EXISTS idx_comments_match ON copabolao_comments(match_id);
 CREATE INDEX IF NOT EXISTS idx_comments_match_group ON copabolao_comments(match_id, group_id);
 CREATE INDEX IF NOT EXISTS idx_predictions_user ON copabolao_predictions(user_id);
 CREATE INDEX IF NOT EXISTS idx_predictions_match ON copabolao_predictions(match_id);
 CREATE INDEX IF NOT EXISTS idx_predictions_group ON copabolao_predictions(group_id);
+CREATE INDEX IF NOT EXISTS idx_events_group_created ON copabolao_events(group_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_events_target_created ON copabolao_events(target_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_predictions_user_group ON copabolao_predictions(user_id, group_id);
 
 -- ==========================================
@@ -91,6 +114,7 @@ ALTER TABLE copabolao_groups ENABLE ROW LEVEL SECURITY;
 ALTER TABLE copabolao_matches ENABLE ROW LEVEL SECURITY;
 ALTER TABLE copabolao_predictions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE copabolao_comments ENABLE ROW LEVEL SECURITY;
+ALTER TABLE copabolao_events ENABLE ROW LEVEL SECURITY;
 
 -- ==========================================
 -- POLÍTICAS RLS: USUÁRIOS (copabolao_users)
@@ -224,6 +248,28 @@ CREATE POLICY "Autor ou admin deleta comentario"
   USING (user_id = auth.uid()::text);
 
 -- ==========================================
+-- POLÍTICAS RLS: EVENTOS (copabolao_events)
+-- ==========================================
+
+-- Eventos são públicos para leitura (parte do feed social).
+-- O cliente faz scoping por bolão (eventos de bolões em que o user é membro).
+CREATE POLICY "Eventos visiveis para todos"
+  ON copabolao_events FOR SELECT
+  USING (true);
+
+-- Insert/update/delete só via service_role (servidor escreve eventos em nome
+-- dos usuários após validar a ação real). Ninguém escreve direto.
+CREATE POLICY "Apenas servidor insere eventos"
+  ON copabolao_events FOR INSERT
+  WITH CHECK (true);
+CREATE POLICY "Apenas servidor atualiza eventos"
+  ON copabolao_events FOR UPDATE
+  USING (true);
+CREATE POLICY "Apenas servidor deleta eventos"
+  ON copabolao_events FOR DELETE
+  USING (true);
+
+-- ==========================================
 -- HABILITAR REALTIME (publicação de mudanças via WebSocket)
 -- ==========================================
 -- Necessário para o app receber updates em tempo real (sem polling).
@@ -233,6 +279,7 @@ ALTER PUBLICATION supabase_realtime ADD TABLE copabolao_groups;
 ALTER PUBLICATION supabase_realtime ADD TABLE copabolao_matches;
 ALTER PUBLICATION supabase_realtime ADD TABLE copabolao_predictions;
 ALTER PUBLICATION supabase_realtime ADD TABLE copabolao_comments;
+ALTER PUBLICATION supabase_realtime ADD TABLE copabolao_events;
 
 -- ==========================================
 -- SEED DO BOLÃO GERAL PÚBLICO ("Geral Copa 2026")
@@ -269,4 +316,24 @@ ON CONFLICT (id) DO NOTHING;
 -- ALTER TABLE copabolao_groups DROP CONSTRAINT IF EXISTS copabolao_groups_creator_id_fkey;
 -- ALTER TABLE copabolao_groups ADD CONSTRAINT copabolao_groups_creator_id_fkey
 --   FOREIGN KEY (creator_id) REFERENCES copabolao_users(id) ON DELETE SET NULL;
+--
+-- -- (v3) Tabela de eventos / feed de novidades:
+-- CREATE TABLE IF NOT EXISTS copabolao_events (
+--     id TEXT PRIMARY KEY,
+--     type TEXT NOT NULL,
+--     group_id TEXT,
+--     actor_id TEXT,
+--     target_id TEXT,
+--     match_id TEXT,
+--     payload JSONB DEFAULT '{}'::jsonb,
+--     created_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL
+-- );
+-- CREATE INDEX IF NOT EXISTS idx_events_group_created ON copabolao_events(group_id, created_at DESC);
+-- CREATE INDEX IF NOT EXISTS idx_events_target_created ON copabolao_events(target_id, created_at DESC);
+-- ALTER TABLE copabolao_events ENABLE ROW LEVEL SECURITY;
+-- CREATE POLICY "Eventos visiveis para todos" ON copabolao_events FOR SELECT USING (true);
+-- CREATE POLICY "Apenas servidor insere eventos" ON copabolao_events FOR INSERT WITH CHECK (true);
+-- CREATE POLICY "Apenas servidor atualiza eventos" ON copabolao_events FOR UPDATE USING (true);
+-- CREATE POLICY "Apenas servidor deleta eventos" ON copabolao_events FOR DELETE USING (true);
+-- ALTER PUBLICATION supabase_realtime ADD TABLE copabolao_events;
 -- ==========================================
