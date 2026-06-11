@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { Clock, Lock, MessageSquare, Save, Eye, ShieldAlert, Sparkles, ChevronRight } from 'lucide-react';
 import { Match, Prediction, User } from '../types';
-import { isMatchLocked } from '../utils/rules';
+import { isMatchLocked, isPredictionInActiveGroup } from '../utils/rules';
 import { motion, AnimatePresence } from 'motion/react';
 import TeamCrest from './TeamCrest';
 import { apiJson } from '../lib/api';
@@ -59,7 +59,7 @@ export default function MatchList({
     // Status mapping for filter
     if (filterTab === 'upcoming') {
       if (match.status !== 'upcoming') return false;
-      const userPred = predictions.find((p) => p.matchId === match.id && p.userId === currentUserId && (activeGroupId ? (p.groupId === activeGroupId || (!p.groupId && activeGroupId === 'g1')) : true));
+      const userPred = predictions.find((p) => p.matchId === match.id && p.userId === currentUserId && isPredictionInActiveGroup(p, activeGroupId));
       if (upcomingFilter === 'not_predicted') {
         return !userPred;
       }
@@ -89,7 +89,7 @@ export default function MatchList({
 
   // Setup initial inputs if not loaded
   const getPrediction = (matchId: string) => {
-    return predictions.find((p) => p.matchId === matchId && p.userId === currentUserId && (activeGroupId ? (p.groupId === activeGroupId || (!p.groupId && activeGroupId === 'g1')) : true));
+    return predictions.find((p) => p.matchId === matchId && p.userId === currentUserId && isPredictionInActiveGroup(p, activeGroupId ?? null));
   };
 
   const handleScoreChange = (matchId: string, side: 'home' | 'away', val: string) => {
@@ -241,14 +241,14 @@ export default function MatchList({
                 matches.filter(m => {
                   if (activeLeague && m.league !== activeLeague) return false;
                   if (m.status !== 'upcoming') return false;
-                  const hasPred = predictions.some(p => p.matchId === m.id && p.userId === currentUserId && (activeGroupId ? (p.groupId === activeGroupId || (!p.groupId && activeGroupId === 'g1')) : true));
+                  const hasPred = predictions.some(p => p.matchId === m.id && p.userId === currentUserId && isPredictionInActiveGroup(p, activeGroupId ?? null));
                   return !hasPred;
                 }).length > 0 ? 'text-amber-400 font-black' : 'text-slate-500'
               }`}>
                 {matches.filter(m => {
                   if (activeLeague && m.league !== activeLeague) return false;
                   if (m.status !== 'upcoming') return false;
-                  const hasPred = predictions.some(p => p.matchId === m.id && p.userId === currentUserId && (activeGroupId ? (p.groupId === activeGroupId || (!p.groupId && activeGroupId === 'g1')) : true));
+                  const hasPred = predictions.some(p => p.matchId === m.id && p.userId === currentUserId && isPredictionInActiveGroup(p, activeGroupId ?? null));
                   return !hasPred;
                 }).length}
               </span>
@@ -268,7 +268,7 @@ export default function MatchList({
                 {matches.filter(m => {
                   if (activeLeague && m.league !== activeLeague) return false;
                   if (m.status !== 'upcoming') return false;
-                  const hasPred = predictions.some(p => p.matchId === m.id && p.userId === currentUserId && (activeGroupId ? (p.groupId === activeGroupId || (!p.groupId && activeGroupId === 'g1')) : true));
+                  const hasPred = predictions.some(p => p.matchId === m.id && p.userId === currentUserId && isPredictionInActiveGroup(p, activeGroupId ?? null));
                   return hasPred;
                 }).length}
               </span>
@@ -627,7 +627,7 @@ export default function MatchList({
                       .filter((u) => !groupMembers || groupMembers.includes(u.id))
                       .map((member) => {
                         const mPred = predictions.find(
-                          (p) => p.matchId === match.id && p.userId === member.id && (activeGroupId ? (p.groupId === activeGroupId || (!p.groupId && activeGroupId === 'g1')) : true)
+                          (p) => p.matchId === match.id && p.userId === member.id && isPredictionInActiveGroup(p, activeGroupId ?? null)
                         );
 
                         return (

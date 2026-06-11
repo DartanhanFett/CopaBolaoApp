@@ -1,7 +1,7 @@
 import React from 'react';
 import { Award, Trophy, Star, ShieldCheck, HelpCircle, Coins, Sparkles, TrendingUp } from 'lucide-react';
 import { Group, Match, Prediction, User } from '../types';
-import { calculatePredictionPoints } from '../utils/rules';
+import { calculatePredictionPoints, isPredictionInActiveGroup } from '../utils/rules';
 import { calculatePrizePool } from '../utils/prizeSplit';
 import { motion } from 'motion/react';
 
@@ -45,8 +45,7 @@ export default function Leaderboard({
       
       // Filter by group_id if sorting within an active group leaderboard
       if (activeGroup) {
-        const matchesGroup = p.groupId === activeGroup.id || (!p.groupId && activeGroup.id === 'g1');
-        if (!matchesGroup) return false;
+        if (!isPredictionInActiveGroup(p, activeGroup.id)) return false;
       }
       
       if (activeLeague) {

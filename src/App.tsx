@@ -108,26 +108,36 @@ export default function App() {
   const currentUser: User = sessionUser || { id: '', name: '', avatar: '', email: '' };
 
   // --- Supabase Persistence Helper Triggers (Proxy REST) ---
-  const savePredictionToDb = (pred: Prediction) => {
-    apiFetch("/api/db/predictions", {
-      method: "POST",
-      body: JSON.stringify(pred)
-    }).catch(e => console.error("Falha ao salvar palpite no Supabase:", e));
+  //
+  // All save helpers return a Promise<{ ok: boolean; message?: string }> instead
+  // of swallowing failures. Call sites that built optimistic UI on top of the
+  // write *must* await and roll back on `ok === false`, otherwise the UI ends
+  // up green ("palpite enviado!") while the row never reached Supabase. Toasts
+  // are surfaced by callers, not here, because the right copy depends on what
+  // the user just tried to do (palpitar / comentar / reagir / etc).
+  type SaveResult = { ok: boolean; message?: string };
+  const persistSave = async (path: string, body: unknown, label: string): Promise<SaveResult> => {
+    try {
+      const data = await apiJson<{ success?: boolean; message?: string }>(path, {
+        method: "POST",
+        body: JSON.stringify(body),
+      });
+      if (data?.success) return { ok: true };
+      return { ok: false, message: data?.message };
+    } catch (e: any) {
+      console.error(`Falha ao salvar (${label}):`, e);
+      return { ok: false, message: e?.message };
+    }
   };
 
-  const saveCommentToDb = (comment: Comment) => {
-    apiFetch("/api/db/comments", {
-      method: "POST",
-      body: JSON.stringify(comment)
-    }).catch(e => console.error("Falha ao salvar comentário no Supabase:", e));
-  };
+  const savePredictionToDb = (pred: Prediction): Promise<SaveResult> =>
+    persistSave("/api/db/predictions", pred, "palpite");
 
-  const saveGroupToDb = (group: Group) => {
-    apiFetch("/api/db/groups", {
-      method: "POST",
-      body: JSON.stringify(group)
-    }).catch(e => console.error("Falha ao salvar grupo no Supabase:", e));
-  };
+  const saveCommentToDb = (comment: Comment): Promise<SaveResult> =>
+    persistSave("/api/db/comments", comment, "comentário");
+
+  const saveGroupToDb = (group: Group): Promise<SaveResult> =>
+    persistSave("/api/db/groups", group, "bolão");
 
   const deleteGroupFromDb = async (groupId: string): Promise<boolean> => {
     try {
@@ -265,23 +275,15 @@ export default function App() {
     }
   };
 
-  const saveUserToDb = (user: User) => {
-    apiFetch("/api/db/users", {
-      method: "POST",
-      body: JSON.stringify(user)
-    }).catch(e => console.error("Falha ao salvar usuário no Supabase:", e));
-  };
+  const saveUserToDb = (user: User): Promise<SaveResult> =>
+    persistSave("/api/db/users", user, "perfil");
 
-  const saveMatchToDb = (match: Match) => {
-    apiFetch("/api/db/matches", {
-      method: "POST",
-      body: JSON.stringify(match)
-    }).catch(e => console.error("Falha ao salvar partida no Supabase:", e));
-  };
+  const saveMatchToDb = (match: Match): Promise<SaveResult> =>
+    persistSave("/api/db/matches", match, "partida");
 
   // Active navigation states
   const [activeTab, setActiveTab] = useState<'groups' | 'matches' | 'ranking' | 'profile' | 'news'>('groups');
-  const [activeGroupId, setActiveGroupId] = useState<string | null>('g1'); // Default to Amigos da Copa to show dynamic live feel instantly!
+  const [activeGroupId, setActiveGroupId] = useState<string | null>(null); // No active bolão until the user picks one — avoids defaulting to a stale 'g1' seed.
   const [showGroupDeleteModal, setShowGroupDeleteModal] = useState(false);
   const [showGroupLeaveModal, setShowGroupLeaveModal] = useState(false);
   const [activeMatchForComments, setActiveMatchForComments] = useState<Match | null>(null);
@@ -329,15 +331,30 @@ export default function App() {
   const [isFirstSyncDone, setIsFirstSyncDone] = useState(false);
 
   /**
-   * Merge two arrays of records by id, preferring the server's version when present.
-   * Records that exist only locally (e.g. matches created custom client-side that haven't
-   * propagated to Supabase yet) are preserved instead of being wiped on each sync.
+   * Reconcile a local list with the server's authoritative view.
+   *
+   * The server's list is treated as the source of truth: anything missing from
+   * the server response is dropped from the merged result. Locally-created
+   * records that haven't propagated yet are preserved by `keepLocal` — pass a
+   * predicate that returns `true` for ids that are still in-flight (e.g.
+   * client-generated `custom_match_*` ids). Without that callback, every local
+   * delete that the server confirms also propagates here, which is what we want
+   * for groups/users/events. The previous version preferred the union, so a
+   * server-side delete never made it back to the client until a hard reload.
    */
-  const mergeById = <T extends { id: string }>(local: T[], server: T[]): T[] => {
-    const byId = new Map<string, T>();
-    for (const item of local) byId.set(item.id, item);
-    for (const item of server) byId.set(item.id, item);
-    return Array.from(byId.values());
+  const reconcileWithServer = <T extends { id: string }>(
+    local: T[],
+    server: T[],
+    keepLocal?: (id: string) => boolean,
+  ): T[] => {
+    const serverIds = new Set(server.map((it) => it.id));
+    const out: T[] = [...server];
+    if (keepLocal) {
+      for (const item of local) {
+        if (!serverIds.has(item.id) && keepLocal(item.id)) out.push(item);
+      }
+    }
+    return out;
   };
 
   const syncData = async (silent = true) => {
@@ -352,31 +369,42 @@ export default function App() {
         apiJson<any>("/api/db/sync?table=copabolao_events"),
       ]);
 
-      // Merge instead of replacing — keeps local-only records (custom matches, optimistic
-      // writes) visible even when the server returns a smaller list. We only fall back
-      // to a hard replace if the server returns NO data at all (success=false).
+      // Reconcile against the server's canonical view. Local-only records
+      // (custom matches in flight, optimistic writes) are preserved via the
+      // `keepLocal` predicate. Everything else: if the server didn't return
+      // it, it's gone — that way deletes on the backend reach the client on
+      // the next sync instead of zombie-living until a hard reload.
       if (matchesRes.success) {
-        setMatches((prev) => mergeById(prev, matchesRes.data || []));
+        setMatches((prev) =>
+          reconcileWithServer(prev, matchesRes.data || [], (id) => id.startsWith("custom_match_")),
+        );
       }
       if (usersRes.success) {
-        setUsers((prev) => mergeById(prev, usersRes.data || []));
+        setUsers((prev) => reconcileWithServer(prev, usersRes.data || []));
       }
       if (predictionsRes.success) {
-        // Predictions are server-canonical (no local-only ones survive long), so we replace
-        // when there's data. Empty arrays don't clobber so the UI doesn't flash empty.
-        if ((predictionsRes.data || []).length > 0) setPredictions(predictionsRes.data);
+        // Predictions are server-canonical and the server's view is authoritative.
+        // Replace as long as we got a non-empty list (an empty array could mean
+        // a transient RLS hiccup — don't blank the UI in that case).
+        if ((predictionsRes.data || []).length > 0) {
+          setPredictions((prev) =>
+            reconcileWithServer(prev, predictionsRes.data, (id) => id.startsWith("temp_")),
+          );
+        }
       }
       if (commentsRes.success) {
-        if ((commentsRes.data || []).length > 0) setComments(commentsRes.data);
+        if ((commentsRes.data || []).length > 0) {
+          setComments((prev) =>
+            reconcileWithServer(prev, commentsRes.data, (id) => id.startsWith("temp_")),
+          );
+        }
       }
       if (groupsRes.success) {
-        setGroups((prev) => mergeById(prev, groupsRes.data || []));
+        setGroups((prev) => reconcileWithServer(prev, groupsRes.data || []));
       }
       if (eventsRes && eventsRes.success) {
-        // Events are append-only — newer ones replace older with the same id.
-        // Merging preserves any optimistically-added local entries (none today
-        // but cheap insurance for future writes).
-        setAppEvents((prev) => mergeById(prev, eventsRes.data || []));
+        // Events are append-only on the server; the server is canonical.
+        setAppEvents((prev) => reconcileWithServer(prev, eventsRes.data || []));
       }
 
       if (!silent) toast.success("Sincronizado com os servidores!");
@@ -603,8 +631,10 @@ export default function App() {
   const handleSavePrediction = (matchId: string, homeScore: number, awayScore: number) => {
     let targetPred: Prediction;
     let isNewPrediction = false;
+    let prevSnapshot: Prediction[] = [];
 
     setPredictions((prev) => {
+      prevSnapshot = prev;
       // Check if already exists for this user, match AND current group
       const existingIdx = prev.findIndex(
         (p) => p.matchId === matchId && p.userId === currentUser.id && p.groupId === activeGroupId
@@ -618,7 +648,6 @@ export default function App() {
           groupId: activeGroupId
         };
         copy[existingIdx] = targetPred;
-        savePredictionToDb(targetPred);
         return copy;
       } else {
         isNewPrediction = true;
@@ -630,8 +659,17 @@ export default function App() {
           awayScore,
           groupId: activeGroupId
         };
-        savePredictionToDb(targetPred);
         return [...prev, targetPred];
+      }
+    });
+
+    // Persist + roll back the optimistic state on failure. We snapshot above
+    // and replay it instead of trying to splice out targetPred — handles both
+    // create and update cleanly with a single restore path.
+    void savePredictionToDb(targetPred!).then((res) => {
+      if (!res.ok) {
+        setPredictions(prevSnapshot);
+        toast.error(res.message || "Não consegui salvar seu palpite. Tenta de novo.");
       }
     });
 
@@ -658,7 +696,15 @@ export default function App() {
         if (prev.some((c) => c.id === predictionMsg.id)) return prev;
         return [...prev, predictionMsg];
       });
-      saveCommentToDb(predictionMsg);
+      // Best-effort: the predictionMsg is a courtesy chat post. If it fails to
+      // save we don't roll back the prediction itself (which has already been
+      // confirmed above), but we do roll back the local chat row so the next
+      // sync doesn't show the message as missing on other devices.
+      void saveCommentToDb(predictionMsg).then((res) => {
+        if (!res.ok) {
+          setComments((prev) => prev.filter((c) => c.id !== predictionMsg.id));
+        }
+      });
     }
   };
 
@@ -678,8 +724,18 @@ export default function App() {
       timestamp: new Date().toISOString(),
       reactions: [],
     };
-    setComments((prev) => [...prev, newComment]);
-    saveCommentToDb(newComment);
+    let prevComments: Comment[] = [];
+    setComments((prev) => {
+      prevComments = prev;
+      return [...prev, newComment];
+    });
+    void saveCommentToDb(newComment).then((res) => {
+      if (!res.ok) {
+        setComments(prevComments);
+        toast.error(res.message || "Não consegui enviar seu comentário. Tenta de novo.");
+        return;
+      }
+    });
 
     // Also mark as read instantly to keep sync
     const now = new Date().toISOString();
@@ -691,8 +747,11 @@ export default function App() {
   };
 
   const handleToggleReaction = (commentId: string, emoji: string) => {
-    setComments((prev) =>
-      prev.map((comment) => {
+    let prevComments: Comment[] = [];
+    let updatedTarget: Comment | null = null;
+    setComments((prev) => {
+      prevComments = prev;
+      return prev.map((comment) => {
         if (comment.id !== commentId) return comment;
 
         // Check if emoji exists in reactions array
@@ -732,10 +791,22 @@ export default function App() {
           ...comment,
           reactions: reactionsCopy.filter((r) => r.count > 0),
         };
-        saveCommentToDb(updatedComment); // Sync updated reactions payload to Supabase
+        updatedTarget = updatedComment;
         return updatedComment;
-      })
-    );
+      });
+    });
+
+    if (updatedTarget) {
+      // Reactions are low-stakes — if the save fails, roll back silently and
+      // surface a quiet toast. We don't want the UI flickering each time
+      // someone double-taps an emoji.
+      void saveCommentToDb(updatedTarget).then((res) => {
+        if (!res.ok) {
+          setComments(prevComments);
+          toast.error("Reação não pegou. Tenta de novo.");
+        }
+      });
+    }
   };
 
   const handleCreateGroup = (
@@ -766,7 +837,15 @@ export default function App() {
     };
 
     setGroups((prev) => [...prev, newGroup]);
-    saveGroupToDb(newGroup); // Sync list additions to cloud
+    void saveGroupToDb(newGroup).then((res) => {
+      if (!res.ok) {
+        // Critical create — if the server rejects, the user thinks they have
+        // a group that nobody else can find. Roll back and explain.
+        setGroups((prev) => prev.filter((g) => g.id !== newGroup.id));
+        if (activeGroupId === newGroup.id) setActiveGroupId(null);
+        toast.error(res.message || "Não consegui criar o bolão. Tenta de novo.");
+      }
+    });
 
     if (customMatch) {
       const newMatch: Match = {
@@ -787,7 +866,14 @@ export default function App() {
       };
 
       setMatches((prev) => [newMatch, ...prev]);
-      saveMatchToDb(newMatch); // Sync custom match addition to db/localStorage
+      void saveMatchToDb(newMatch).then((res) => {
+        if (!res.ok) {
+          // Custom match save failed — drop it from local state so the
+          // bolão's match list doesn't show a phantom row.
+          setMatches((prev) => prev.filter((m) => m.id !== newMatch.id));
+          toast.error(res.message || "Bolão criado, mas o jogo personalizado não salvou.");
+        }
+      });
     }
 
     setActiveGroupId(newGroup.id);

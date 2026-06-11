@@ -1,4 +1,32 @@
 import { Match, Prediction } from '../types';
+import { DEFAULT_GROUP } from '../data/constants';
+
+/**
+ * Does a prediction belong to the bolão the user is currently looking at?
+ *
+ * Three cases the call sites have to handle (and, until this helper existed,
+ * each kept duplicating with subtle drift):
+ *
+ *   1. No active bolão (`activeGroupId` null) — show everything; the caller is
+ *      in a "global" view (e.g. the standalone matches tab pre-bolão).
+ *   2. Prediction has a `groupId` — must equal the active one.
+ *   3. Legacy prediction (no `groupId`) — predates the per-bolão schema and
+ *      counts as belonging to the canonical default group. Without this rule
+ *      old palpites would silently disappear from the leaderboard the moment
+ *      the user opened the default group.
+ *
+ * Centralizing the logic also means flipping the default group constant in
+ * one place instead of grepping for the magic 'g1'/`DEFAULT_GROUP.id` string.
+ */
+export function isPredictionInActiveGroup(
+  pred: { groupId?: string | null },
+  activeGroupId: string | null,
+): boolean {
+  if (!activeGroupId) return true;
+  if (pred.groupId === activeGroupId) return true;
+  if (!pred.groupId && activeGroupId === DEFAULT_GROUP.id) return true;
+  return false;
+}
 
 /**
  * Calculates current points earned for a prediction compared to match results.
