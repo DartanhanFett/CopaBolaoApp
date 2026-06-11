@@ -999,17 +999,9 @@ export default function App() {
     return out;
   }, [matches, comments, lastOpenedCommentsAt, activeGroupId, currentUser.id]);
 
-  // Total unread across all matches in the active league/bolão. Used by the
-  // BottomNav badge so the user knows there's chatter even when looking at
-  // a different tab.
-  const totalUnread = useMemo(() => {
-    let sum = 0;
-    for (const m of matches) {
-      if (activeGroup && m.league !== activeGroup.league) continue;
-      sum += unreadByMatch.get(m.id) ?? 0;
-    }
-    return sum;
-  }, [matches, unreadByMatch, activeGroup]);
+  // (Removed: totalUnread per-tab badge. All cross-tab notifications are
+  // funneled through the unified Novidades feed below — keeping a separate
+  // comment-only counter on Bolões/Jogos was redundant noise.)
 
   // Unread events for the news tab. Same scoping rule as the NewsTab itself:
   // events from the active bolão (or globally-scoped) that arrived after the
@@ -1658,7 +1650,6 @@ export default function App() {
       <BottomNav
         activeTab={activeTab}
         setActiveTab={setActiveTab}
-        unreadCommentsCount={totalUnread}
         unreadNewsCount={unreadNewsCount}
       />
     </div>

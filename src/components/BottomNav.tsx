@@ -5,17 +5,15 @@ import { motion } from 'motion/react';
 interface BottomNavProps {
   activeTab: 'groups' | 'matches' | 'ranking' | 'profile' | 'news';
   setActiveTab: (tab: 'groups' | 'matches' | 'ranking' | 'profile' | 'news') => void;
-  /** Total unread comments across the active bolão. Drives the numeric badge on
-   *  both the "Jogos" and "Meus Bolões" tabs. 0 hides the badge. */
-  unreadCommentsCount?: number;
-  /** Total unread feed events. Same idea but on the Novidades tab. */
+  /** Total unread feed events on the Novidades tab. All notification surfaces
+   *  (comments, predictions, ranking shuffles, match transitions) funnel here
+   *  so users have one canonical "go look" cue instead of duplicate badges. */
   unreadNewsCount?: number;
 }
 
 export default function BottomNav({
   activeTab,
   setActiveTab,
-  unreadCommentsCount = 0,
   unreadNewsCount = 0,
 }: BottomNavProps) {
   const tabs = [
@@ -26,11 +24,10 @@ export default function BottomNav({
     { id: 'profile', label: 'Perfil', icon: User },
   ] as const;
 
-  // Show a numeric badge on whichever tab the user is NOT currently on. The
-  // active tab is hidden because they're already there — badge would be noise.
+  // Only the Novidades tab gets a badge — and only when the user is not
+  // currently looking at it. Single source of truth for "something happened".
   const badgeCountFor = (id: string): number => {
     if (id === activeTab) return 0;
-    if (id === 'matches' || id === 'groups') return unreadCommentsCount;
     if (id === 'news') return unreadNewsCount;
     return 0;
   };
