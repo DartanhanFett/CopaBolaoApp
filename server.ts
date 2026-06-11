@@ -152,9 +152,22 @@ function sanitizeError(err: unknown): string {
   return String(err);
 }
 
-/** Log errors safely without leaking secrets */
+/** Log errors safely without leaking secrets. Serializes plain objects (e.g.
+ *  Supabase's `{ message, code, details, hint }` payloads) so we don't end up
+ *  with useless "[object Object]" lines in the Fly log. */
 function logError(context: string, err: unknown): void {
-  const message = err instanceof Error ? err.message : String(err);
+  let message: string;
+  if (err instanceof Error) {
+    message = err.message;
+  } else if (err && typeof err === "object") {
+    try {
+      message = JSON.stringify(err);
+    } catch {
+      message = String(err);
+    }
+  } else {
+    message = String(err);
+  }
   console.error(`[${context}] ${message}`);
 }
 
