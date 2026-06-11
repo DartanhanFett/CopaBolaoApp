@@ -16,7 +16,11 @@ interface MatchListProps {
   onOpenComments: (match: Match) => void;
   activeLeague?: string;
   groupMembers?: string[]; // user IDs in active group
-  unreadMatchIds?: string[]; // list of match IDs with unread comments
+  unreadMatchIds?: string[]; // list of match IDs with unread comments (legacy/boolean)
+  /** New, more granular: count of unread comments per match id. When provided,
+   *  the per-card badge shows the number; otherwise we fall back to the boolean
+   *  list above (backward compat with older callers). */
+  unreadCountByMatch?: Map<string, number>;
   onMarkAllCommentsAsRead?: () => void;
   activeGroupId?: string;
   // IANA tz string or "auto". Propagated from sessionUser so users on VPN see the
@@ -34,6 +38,7 @@ export default function MatchList({
   activeLeague,
   groupMembers,
   unreadMatchIds = [],
+  unreadCountByMatch,
   onMarkAllCommentsAsRead,
   activeGroupId,
   userTimezone = 'auto',
@@ -518,7 +523,10 @@ export default function MatchList({
 
                   {/* Chat Icon launcher */}
                   {(() => {
-                    const hasUnread = unreadMatchIds.includes(match.id);
+                    // Prefer the precise count when the parent provides it; fall
+                    // back to the older boolean list for any legacy caller.
+                    const unreadCount = unreadCountByMatch?.get(match.id) ?? 0;
+                    const hasUnread = unreadCount > 0 || unreadMatchIds.includes(match.id);
                     return (
                       <button
                         onClick={() => onOpenComments(match)}
@@ -536,8 +544,10 @@ export default function MatchList({
                         </div>
                         <span>Resenha / Chat</span>
                         {hasUnread && (
-                          <span className="text-[9px] bg-rose-500 text-slate-100 font-bold px-1.5 py-0.5 rounded-full leading-none animate-pulse">
-                            Novo
+                          // Numeric pill: shows the count when known (e.g. "3"),
+                          // capped at "9+" so it never wraps to two digits in tight UI.
+                          <span className="text-[9px] bg-rose-500 text-slate-100 font-bold px-1.5 py-0.5 rounded-full leading-none animate-pulse min-w-[18px] text-center">
+                            {unreadCount > 0 ? (unreadCount > 9 ? '9+' : unreadCount) : 'Novo'}
                           </span>
                         )}
                       </button>

@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { Trophy, Users, Star, MessageSquare, ChevronLeft, Calendar, HelpCircle, UserCheck, Plus, Sparkles, BookOpen, AlertCircle, Share2, Info, Copy, Trash2, LogOut, RefreshCw } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { Toaster, toast } from 'react-hot-toast';
@@ -21,6 +21,7 @@ import { apiFetch, apiJson } from './lib/api';
 import { getSupabase } from '../lib/supabase/client';
 import { DEFAULT_GROUP, DEFAULT_GROUP_VISIBLE } from './data/constants';
 import { encodePredictionMessage } from './utils/predictionMessage';
+import { requestNotificationPermission, showNotification } from './utils/notifications';
 
 const DEFAULT_GROUP_CODE = DEFAULT_GROUP.code;
 
@@ -289,6 +290,10 @@ export default function App() {
       localStorage.setItem('copabolao_comments_read_timestamps', JSON.stringify(next));
       return next;
     });
+    // Opening a chat is a strong "I care about updates" signal — request
+    // notification permission opportunistically. Browsers ignore the call if
+    // permission is already granted/denied, so this is safe to fire repeatedly.
+    requestNotificationPermission().catch(() => {});
   };
 
   const handleMarkAllCommentsAsRead = () => {
@@ -929,6 +934,105 @@ export default function App() {
     }
   }, []);
 
+  // Per-match unread comment counts, scoped to the active bolão. Computed once
+  // here and threaded into MatchList + BottomNav so badges show "3" instead of
+  // a generic "•". Legacy comments without a groupId stay visible everywhere
+  // (preserves chat history from before group scoping landed).
+  const unreadByMatch = useMemo(() => {
+    const out = new Map<string, number>();
+    for (const m of matches) {
+      const matchComments = comments.filter(
+        (c) => c.matchId === m.id && (!c.groupId || c.groupId === activeGroupId)
+      );
+      if (matchComments.length === 0) continue;
+      const lastRead = lastOpenedCommentsAt[m.id];
+      const lastReadMs = lastRead ? new Date(lastRead).getTime() : 0;
+      let unread = 0;
+      for (const c of matchComments) {
+        if (new Date(c.timestamp).getTime() > lastReadMs) unread++;
+      }
+      // Skip the user's own messages — you don't get notified about your own typing.
+      // Filter is approximate (only by userId, doesn't handle prediction system messages
+      // separately), but good enough to avoid the "you typed 1 message → badge says 1" surprise.
+      const ownNew = matchComments.filter(
+        (c) => c.userId === currentUser.id && new Date(c.timestamp).getTime() > lastReadMs
+      ).length;
+      const externalUnread = unread - ownNew;
+      if (externalUnread > 0) out.set(m.id, externalUnread);
+    }
+    return out;
+  }, [matches, comments, lastOpenedCommentsAt, activeGroupId, currentUser.id]);
+
+  // Total unread across all matches in the active league/bolão. Used by the
+  // BottomNav badge so the user knows there's chatter even when looking at
+  // a different tab.
+  const totalUnread = useMemo(() => {
+    let sum = 0;
+    for (const m of matches) {
+      if (activeGroup && m.league !== activeGroup.league) continue;
+      sum += unreadByMatch.get(m.id) ?? 0;
+    }
+    return sum;
+  }, [matches, unreadByMatch, activeGroup]);
+
+  // Track which comment IDs we've already shown / seen, so we don't re-notify
+  // for the same comment on every re-render. Ref instead of state because we
+  // don't want to re-trigger the effect when this set updates.
+  const seenCommentIdsRef = useRef<Set<string>>(new Set());
+  // Remember whether this effect has run once. On the first render after login
+  // the comments list arrives all at once — we don't want to spam a flood of
+  // "new comment" notifications for messages that are days old.
+  const notificationsBootstrappedRef = useRef(false);
+
+  useEffect(() => {
+    if (!sessionUser) return;
+
+    // First pass: just remember everything that's already there. No notifications.
+    if (!notificationsBootstrappedRef.current) {
+      for (const c of comments) seenCommentIdsRef.current.add(c.id);
+      notificationsBootstrappedRef.current = true;
+      return;
+    }
+
+    // Subsequent passes: any comment id we haven't seen is "new since last render".
+    // Notify only when:
+    //   - it's not from the current user (don't notify yourself about yourself),
+    //   - it's scoped to the active bolão (or legacy unscoped),
+    //   - the chat for that match isn't currently open in foreground,
+    //   - and the tab is hidden (showNotification handles the visibility check).
+    const newOnes = comments.filter((c) => !seenCommentIdsRef.current.has(c.id));
+    for (const c of newOnes) {
+      seenCommentIdsRef.current.add(c.id);
+      if (c.userId === currentUser.id) continue;
+      if (c.groupId && c.groupId !== activeGroupId) continue;
+      if (activeMatchForComments?.id === c.matchId) continue;
+
+      const match = matches.find((m) => m.id === c.matchId);
+      const matchLabel = match
+        ? `${match.homeTeam.name} x ${match.awayTeam.name}`
+        : "Novo comentário";
+      showNotification({
+        title: `${c.userName} comentou em ${matchLabel}`,
+        body: c.text.length > 120 ? `${c.text.slice(0, 117)}…` : c.text,
+        matchId: c.matchId,
+        tag: `match:${c.matchId}`,
+      });
+    }
+  }, [comments, sessionUser, currentUser.id, activeGroupId, activeMatchForComments, matches]);
+
+  // When the user clicks a system notification (handler in utils/notifications.ts
+  // dispatches a CustomEvent), open the corresponding match chat.
+  useEffect(() => {
+    const onOpen = (e: Event) => {
+      const detail = (e as CustomEvent).detail;
+      if (!detail?.matchId) return;
+      const match = matches.find((m) => m.id === detail.matchId);
+      if (match) handleOpenComments(match);
+    };
+    window.addEventListener("copabolao:open-match-chat", onOpen);
+    return () => window.removeEventListener("copabolao:open-match-chat", onOpen);
+  }, [matches]);
+
   if (!authChecked) {
     // Brief splash while we figure out who is logged in
     return (
@@ -1300,19 +1404,8 @@ export default function App() {
                 activeLeague={activeGroup?.league}
                 groupMembers={activeGroup?.members}
                 activeGroupId={activeGroupId}
-                unreadMatchIds={matches.filter(m => {
-                  // Same group-scoping rule used everywhere chat is shown:
-                  // include legacy comments where groupId is null/undefined
-                  // (those predate the migration and shouldn't disappear).
-                  const matchComments = comments.filter(c =>
-                    c.matchId === m.id
-                    && (!c.groupId || c.groupId === activeGroupId)
-                  );
-                  if (matchComments.length === 0) return false;
-                  const lastReadTime = lastOpenedCommentsAt[m.id];
-                  if (!lastReadTime) return true;
-                  return matchComments.some(c => new Date(c.timestamp).getTime() > new Date(lastReadTime).getTime());
-                }).map(m => m.id)}
+                unreadMatchIds={Array.from(unreadByMatch.keys())}
+                unreadCountByMatch={unreadByMatch}
                 onMarkAllCommentsAsRead={handleMarkAllCommentsAsRead}
                 userTimezone={sessionUser?.timezone || 'auto'}
               />
@@ -1505,19 +1598,7 @@ export default function App() {
       <BottomNav
         activeTab={activeTab}
         setActiveTab={setActiveTab}
-        hasUnreadComments={matches.some(m => {
-          if (activeGroup && m.league !== activeGroup.league) return false;
-
-          // Group-scoped unread badge — same rule as the per-match unread filter above.
-          const matchComments = comments.filter(c =>
-            c.matchId === m.id
-            && (!c.groupId || c.groupId === activeGroupId)
-          );
-          if (matchComments.length === 0) return false;
-          const lastReadTime = lastOpenedCommentsAt[m.id];
-          if (!lastReadTime) return true;
-          return matchComments.some(c => new Date(c.timestamp).getTime() > new Date(lastReadTime).getTime());
-        })}
+        unreadCommentsCount={totalUnread}
       />
     </div>
   );

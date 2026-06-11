@@ -5,10 +5,12 @@ import { motion } from 'motion/react';
 interface BottomNavProps {
   activeTab: 'groups' | 'matches' | 'ranking' | 'profile';
   setActiveTab: (tab: 'groups' | 'matches' | 'ranking' | 'profile') => void;
-  hasUnreadComments?: boolean;
+  /** Total unread comments across the active bolão. Drives the numeric badge on
+   *  both the "Jogos" and "Meus Bolões" tabs. 0 hides the badge. */
+  unreadCommentsCount?: number;
 }
 
-export default function BottomNav({ activeTab, setActiveTab, hasUnreadComments }: BottomNavProps) {
+export default function BottomNav({ activeTab, setActiveTab, unreadCommentsCount = 0 }: BottomNavProps) {
   const tabs = [
     { id: 'groups', label: 'Meus Bolões', icon: Users },
     { id: 'matches', label: 'Jogos', icon: Flame },
@@ -16,12 +18,22 @@ export default function BottomNav({ activeTab, setActiveTab, hasUnreadComments }
     { id: 'profile', label: 'Meu Perfil', icon: User },
   ] as const;
 
+  // Show the unread badge on whichever tab the user is NOT currently on, so it
+  // serves as a real "go check this" cue. Showing it on the active tab would
+  // be noise — they're already there.
+  const showBadgeOn = (id: string) => {
+    if (unreadCommentsCount <= 0) return false;
+    if (id === activeTab) return false;
+    return id === 'matches' || id === 'groups';
+  };
+
   return (
     <nav className="fixed bottom-0 left-0 right-0 z-50 bg-slate-900/95 backdrop-blur-md border-t border-slate-800 pb-safe shadow-xl">
       <div className="max-w-md mx-auto px-4 h-16 flex items-center justify-around">
         {tabs.map((tab) => {
           const Icon = tab.icon;
           const isActive = activeTab === tab.id;
+          const showBadge = showBadgeOn(tab.id);
 
           return (
             <button
@@ -45,8 +57,14 @@ export default function BottomNav({ activeTab, setActiveTab, hasUnreadComments }
                       : 'text-slate-400 hover:text-slate-300'
                   }`}
                 />
-                {tab.id === 'matches' && hasUnreadComments && (
-                  <span className="absolute -top-1 -right-1 w-2.5 h-2.5 bg-rose-500 rounded-full animate-pulse border border-slate-900" />
+                {showBadge && (
+                  // Numeric pill anchored to the icon's top-right. Capped at "9+"
+                  // so it never grows wider than the tab cell. min-w keeps the
+                  // single-digit "1" / "9" the same width as "9+" so the icon
+                  // doesn't shift around as the count changes.
+                  <span className="absolute -top-1.5 -right-2.5 min-w-[18px] h-[18px] px-1 bg-rose-500 text-slate-50 text-[9px] font-extrabold rounded-full border border-slate-900 leading-none flex items-center justify-center animate-pulse">
+                    {unreadCommentsCount > 9 ? '9+' : unreadCommentsCount}
+                  </span>
                 )}
               </div>
               <span
