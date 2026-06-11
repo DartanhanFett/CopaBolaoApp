@@ -544,6 +544,21 @@ async function startServer() {
     return aiInstance;
   }
 
+  // In-memory cache for AI score suggestions, keyed by "<homeTeam>|<awayTeam>".
+  // Why this exists: free-tier Gemini quota is 500 req/day. With 30 users × 64
+  // matches, a no-cache deployment exhausts quota before any games are even
+  // played. Cache means each fixture costs at most one Gemini call regardless
+  // of how many users hit the IA button.
+  // 24h TTL is intentional — the suggestion is meant to be a fun/canned vibe,
+  // not real-time prediction tuning. If you want fresher suggestions, drop the TTL.
+  // The cache lives in-memory; restarting the server (e.g. fly deploy) wipes it.
+  // For the demo scale (one VM, infrequent restarts), that's fine.
+  type AiSuggestion = { homeScore: number; awayScore: number; reasoning: string; isAiGenerated: boolean };
+  const aiCache = new Map<string, { value: AiSuggestion; expiresAt: number }>();
+  const AI_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+  const aiCacheKey = (home: string, away: string) =>
+    `${home.trim().toLowerCase()}|${away.trim().toLowerCase()}`;
+
   // REST API: Suggest score and prediction with AI using Gemini.
   // Public endpoint (no auth required) — it doesn't read user data, just returns a score guess.
   app.post("/api/ai/suggest-score", async (req, res) => {
@@ -553,6 +568,14 @@ async function startServer() {
     }
 
     const { homeTeam, awayTeam } = parsed.data;
+
+    // Fast path: serve a cached suggestion when one is fresh. Saves a Gemini call
+    // for every user after the first who clicks IA on the same fixture.
+    const cacheKey = aiCacheKey(homeTeam, awayTeam);
+    const cached = aiCache.get(cacheKey);
+    if (cached && cached.expiresAt > Date.now()) {
+      return res.json(cached.value);
+    }
 
     const ai = getGeminiClient();
     if (!ai) {
@@ -644,12 +667,17 @@ Responda APENAS o JSON.`;
       const responseText = response.text || "{}";
       const parsedAi = JSON.parse(responseText.trim());
 
-      return res.json({
+      const result: AiSuggestion = {
         homeScore: typeof parsedAi.homeScore === "number" ? parsedAi.homeScore : 1,
         awayScore: typeof parsedAi.awayScore === "number" ? parsedAi.awayScore : 0,
         reasoning: parsedAi.reasoning || "Futebol é caixinha de surpresa!",
         isAiGenerated: true,
-      });
+      };
+      // Only persist successful AI responses. Canned fallbacks stay uncached so
+      // they get retried with the real model on the next request (e.g. when
+      // quota resets at midnight UTC).
+      aiCache.set(cacheKey, { value: result, expiresAt: Date.now() + AI_CACHE_TTL_MS });
+      return res.json(result);
     } catch (e: any) {
       logError("ai-suggest-score", e);
       // Reuse the same canned pool as the no-key fallback — picking randomly so
