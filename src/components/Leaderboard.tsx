@@ -2,6 +2,7 @@ import React from 'react';
 import { Award, Trophy, Star, ShieldCheck, HelpCircle, Coins, Sparkles, TrendingUp } from 'lucide-react';
 import { Group, Match, Prediction, User } from '../types';
 import { calculatePredictionPoints } from '../utils/rules';
+import { calculatePrizePool } from '../utils/prizeSplit';
 import { motion } from 'motion/react';
 
 interface LeaderboardProps {
@@ -96,31 +97,59 @@ export default function Leaderboard({
   });
 
   const entryFee = activeGroup?.entryFee || 0;
-  const totalPrizePot = entryFee * rankedUsers.length;
+  // Suggested split (70/20/10) for the top 3 — only meaningful when there's an
+  // actual entry fee. Free bolões skip the prize card entirely.
+  const prizePool = calculatePrizePool(entryFee, rankedUsers.length);
 
   return (
     <div className="space-y-6">
-      {/* Group Cash Pool Header */}
-      {activeGroup && (
-        <div className="p-4 bg-gradient-to-r from-slate-900 to-teal-950/80 border border-teal-500/25 rounded-2xl flex items-center justify-between shadow-xl">
-          <div className="space-y-1">
-            <span className="text-[10px] text-teal-400 font-bold uppercase tracking-widest block">
-              Prêmio do Bolão 💰
-            </span>
-            <h4 className="text-sm font-semibold text-slate-100">
-              Acumulado no Grupo
-            </h4>
-            <p className="text-[11px] text-slate-400">
-              {rankedUsers.length} participantes • taxa de R$ {entryFee.toFixed(2)}
-            </p>
+      {/* Prize pool with top-3 suggested split. Hidden for free bolões. */}
+      {activeGroup && prizePool && (
+        <div className="p-4 bg-gradient-to-br from-slate-900 to-teal-950/80 border border-teal-500/25 rounded-2xl shadow-xl space-y-3">
+          <div className="flex items-start justify-between">
+            <div className="space-y-1">
+              <span className="text-[10px] text-teal-400 font-bold uppercase tracking-widest block">
+                💰 Prêmio sugerido do bolão
+              </span>
+              <p className="text-[11px] text-slate-400">
+                {rankedUsers.length} participantes × R$ {entryFee.toFixed(2)}
+              </p>
+            </div>
+            <div className="text-right">
+              <span className="text-[10px] text-slate-400 block font-medium uppercase tracking-wide">
+                Pool total
+              </span>
+              <span className="text-2xl font-black font-mono text-emerald-400 tracking-tight">
+                R$ {prizePool.totalPool.toFixed(2)}
+              </span>
+            </div>
           </div>
 
-          <div className="text-right">
-            <span className="text-xs text-slate-400 block font-medium">Prêmio para o 1º Lugar</span>
-            <span className="text-2xl font-black font-mono text-emerald-400 tracking-tight">
-              R$ {totalPrizePot.toFixed(2)}
-            </span>
+          {/* Top 3 split (70/20/10). Each row maps to the rank with the same emoji
+              shown in the leaderboard table below — visual continuity. */}
+          <div className="grid grid-cols-3 gap-2 pt-1">
+            {prizePool.shares.map((share) => (
+              <div
+                key={share.rank}
+                className="bg-slate-950/60 border border-slate-800 rounded-xl p-2 text-center"
+              >
+                <div className="text-base">{share.emoji}</div>
+                <div className="text-[9px] text-slate-500 font-bold uppercase tracking-wider mt-0.5">
+                  {share.label} · {share.pct}%
+                </div>
+                <div className="text-sm font-mono font-extrabold text-emerald-400 mt-0.5">
+                  R$ {share.amount.toFixed(2)}
+                </div>
+              </div>
+            ))}
           </div>
+
+          {/* Disclaimer: the app is just a calculator. Real money moves between
+              members offline. Keeps us out of "facilitação de aposta" territory. */}
+          <p className="text-[10px] text-slate-500 leading-snug pt-2 border-t border-slate-800/60">
+            ℹ️ O app não recebe nem distribui prêmios — combinem o pagamento entre vocês
+            via PIX. Esses valores são apenas uma sugestão de divisão.
+          </p>
         </div>
       )}
 
