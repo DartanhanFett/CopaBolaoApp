@@ -593,8 +593,15 @@ Responda APENAS o JSON.`;
       // that smell like model availability problems. 1.5-flash is broadly available
       // on the free tier; 2.5-flash isn't always — and the error spelling varies
       // across SDK versions.
+      // Try the configured model first; fall back to the lite sibling on errors
+      // that smell like model-availability problems. Why these picks:
+      //   - 2.5-flash: stable, broadly available on AI Studio free tier (june/2026)
+      //   - 2.5-flash-lite: cheaper / more permissive quota — good safety net
+      //                     when the primary hits a transient issue
+      // We deliberately do NOT fall back to gemini-1.5-flash anymore: Google
+      // returned `404 not found` for it on v1beta in tests on 2026-06-10.
       const primaryModel = process.env.GEMINI_MODEL || "gemini-2.5-flash";
-      const fallbackModel = "gemini-1.5-flash";
+      const fallbackModel = "gemini-2.5-flash-lite";
 
       const callModel = async (modelName: string) => {
         return ai.models.generateContent({

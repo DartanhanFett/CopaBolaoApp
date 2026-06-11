@@ -13,7 +13,10 @@ if (!key) {
   process.exit(1);
 }
 
-const models = ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-2.0-flash"];
+// Models to probe. Updated 2026-06-10 — 1.5-flash is deprecated on v1beta and
+// 2.0-flash isn't enabled by default for new free-tier accounts. The "lite"
+// sibling of 2.5 is the best free-tier safety net we've found.
+const models = ["gemini-2.5-flash", "gemini-2.5-flash-lite"];
 const ai = new GoogleGenAI({ apiKey: key });
 
 for (const model of models) {
