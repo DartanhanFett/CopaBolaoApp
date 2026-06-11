@@ -8,6 +8,7 @@ import { INITIAL_USERS, INITIAL_MATCHES, INITIAL_GROUPS, INITIAL_COMMENTS } from
 import { INITIAL_PREDICTIONS } from './data/initialPredictions';
 import BottomNav from './components/BottomNav';
 import GroupList from './components/GroupList';
+import NextMatchCard from './components/NextMatchCard';
 import MatchList from './components/MatchList';
 import Leaderboard from './components/Leaderboard';
 import MatchCommentSection from './components/MatchCommentSection';
@@ -1565,18 +1566,29 @@ export default function App() {
             transition={{ duration: 0.15 }}
           >
             {activeTab === 'groups' ? (
-              <GroupList
-                groups={groups}
-                users={users}
-                currentUserId={currentUser.id}
-                onSelectGroup={(id) => {
-                  setActiveGroupId(id);
-                  setActiveTab('matches'); // Go straight to their matches!
-                }}
-                onOpenCreateModal={handleOpenCreateModal}
-                onDeleteGroup={handleDeleteGroup}
-                onJoinGroup={handleJoinGroup}
-              />
+              <>
+                {/* Live "next match" hero card. Pinned to the top of the bolões
+                    list because it's the single most attention-grabbing piece
+                    of the app — countdown ticks every second and tapping
+                    jumps straight to the matches tab to drop a palpite. */}
+                <NextMatchCard
+                  matches={matches}
+                  league={activeGroup?.league}
+                  onJumpToMatches={() => setActiveTab('matches')}
+                />
+                <GroupList
+                  groups={groups}
+                  users={users}
+                  currentUserId={currentUser.id}
+                  onSelectGroup={(id) => {
+                    setActiveGroupId(id);
+                    setActiveTab('matches'); // Go straight to their matches!
+                  }}
+                  onOpenCreateModal={handleOpenCreateModal}
+                  onDeleteGroup={handleDeleteGroup}
+                  onJoinGroup={handleJoinGroup}
+                />
+              </>
             ) : activeTab === 'matches' ? (
               <MatchList
                 matches={matches}
