@@ -107,6 +107,34 @@ CREATE INDEX IF NOT EXISTS idx_events_target_created ON copabolao_events(target_
 CREATE INDEX IF NOT EXISTS idx_predictions_user_group ON copabolao_predictions(user_id, group_id);
 
 -- ==========================================
+-- RPC: copabolao_group_add_member
+-- ==========================================
+-- Adiciona um membro ao array `members` de copabolao_groups de forma atômica.
+-- Resolve a race condition onde duas chamadas simultâneas a /api/groups/join
+-- liam o array, faziam push local, e a segunda escrita silenciosamente
+-- sobrescrevia a primeira. O Postgres array_append + jsonb_path nas
+-- coordenadas certas torna isso impossível.
+--
+-- Retorna o grupo já atualizado (mesma shape de SELECT *) para o servidor não
+-- precisar de uma segunda query.
+CREATE OR REPLACE FUNCTION copabolao_group_add_member(p_group_id TEXT, p_user_email TEXT)
+RETURNS SETOF copabolao_groups
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  RETURN QUERY
+  UPDATE copabolao_groups
+  SET members = CASE
+    WHEN members @> to_jsonb(p_user_email) THEN members
+    ELSE members || to_jsonb(p_user_email)
+  END
+  WHERE id = p_group_id
+    AND deleted IS NOT TRUE
+  RETURNING *;
+END;
+$$;
+
+-- ==========================================
 -- HABILITAR ROW LEVEL SECURITY (RLS) EM TODAS AS TABELAS
 -- ==========================================
 ALTER TABLE copabolao_users ENABLE ROW LEVEL SECURITY;
@@ -336,4 +364,21 @@ ON CONFLICT (id) DO NOTHING;
 -- CREATE POLICY "Apenas servidor atualiza eventos" ON copabolao_events FOR UPDATE USING (true);
 -- CREATE POLICY "Apenas servidor deleta eventos" ON copabolao_events FOR DELETE USING (true);
 -- ALTER PUBLICATION supabase_realtime ADD TABLE copabolao_events;
+--
+-- -- (v4) RPC atômica para resolver race ao adicionar membros num bolão:
+-- CREATE OR REPLACE FUNCTION copabolao_group_add_member(p_group_id TEXT, p_user_email TEXT)
+-- RETURNS SETOF copabolao_groups
+-- LANGUAGE plpgsql
+-- AS $$
+-- BEGIN
+--   RETURN QUERY
+--   UPDATE copabolao_groups
+--   SET members = CASE
+--     WHEN members @> to_jsonb(p_user_email) THEN members
+--     ELSE members || to_jsonb(p_user_email)
+--   END
+--   WHERE id = p_group_id AND deleted IS NOT TRUE
+--   RETURNING *;
+-- END;
+-- $$;
 -- ==========================================

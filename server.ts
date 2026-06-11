@@ -240,6 +240,37 @@ async function fetchMatchLabel(supabase: any, matchId: string): Promise<string> 
   }
 }
 
+/**
+ * Returns the set of group ids the user can see:
+ *   - groups they're a member of (active, not soft-deleted)
+ *   - the public default group (always visible — landing point for newcomers)
+ * Used by /api/db/sync to scope groups/predictions/comments/events so a user
+ * never sees data from a private bolão they don't belong to.
+ *
+ * On any error (table missing, transient Supabase blip), returns an empty set
+ * — the safe default is "show nothing" rather than "leak everything".
+ */
+async function fetchUserVisibleGroupIds(supabase: any, email: string): Promise<Set<string>> {
+  const out = new Set<string>();
+  if (!supabase || !email) return out;
+  try {
+    const { data } = await supabase
+      .from("copabolao_groups")
+      .select("id, members, deleted");
+    for (const g of data || []) {
+      if (g.deleted === true) continue;
+      if (Array.isArray(g.members) && g.members.some((m: string) => (m || "").toLowerCase() === email)) {
+        out.add(g.id);
+      }
+    }
+  } catch {
+    // fall through — return whatever we accumulated (likely empty)
+  }
+  // Public default group is always visible (welcome flow + explore tab).
+  out.add(DEFAULT_GROUP.id);
+  return out;
+}
+
 // ─── Auth Middleware ────────────────────────────────────────────────────────
 
 /**
@@ -1129,8 +1160,22 @@ Responda APENAS o JSON.`;
       });
     }
 
+    // CRITICAL: this endpoint used to be open to anonymous callers. With service_role
+    // bypassing RLS, that exposed every private bolão's predictions/comments/members
+    // to anyone with the URL. Now we require a valid JWT before reading anything.
+    const authUser = await authenticateRequest(supabase, req.headers.authorization);
+    if (!authUser) {
+      return res.status(401).json({ connected: false, message: "Autenticação necessária." });
+    }
+
     const queryParsed = dbSyncQuerySchema.safeParse(req.query);
     const tableName = queryParsed.success ? queryParsed.data.table : undefined;
+
+    // Computed once per request: the set of group ids this user is allowed to see.
+    // Anything scoped to a group not in this set is filtered out below. Public/global
+    // rows (groupId == null) stay visible to everyone — used for things like
+    // match.live events that affect every bolão running the same fixture.
+    const visibleGroupIds = await fetchUserVisibleGroupIds(supabase, authUser.email);
 
     await syncMutex.acquire();
     try {
@@ -1167,8 +1212,11 @@ Responda APENAS o JSON.`;
         if (tableName === "copabolao_groups") {
           const { data, error } = await supabase.from("copabolao_groups").select("*");
           if (error) return res.json({ success: false, error: "Erro ao consultar grupos." });
+          // Only expose: groups the user is a member of, the public default group,
+          // and other PUBLIC (non-private) groups for the "Explorar" tab.
           const mappedGroups = (data || [])
             .filter((g: any) => g.deleted !== true)
+            .filter((g: any) => visibleGroupIds.has(g.id) || g.is_private !== true)
             .map((g: any) => ({
               id: g.id,
               name: g.name,
@@ -1185,31 +1233,39 @@ Responda APENAS o JSON.`;
         if (tableName === "copabolao_predictions") {
           const { data, error } = await supabase.from("copabolao_predictions").select("*");
           if (error) return res.json({ success: false, error: "Erro ao consultar palpites." });
-          const mappedPredictions = (data || []).map((p: any) => ({
-            id: p.id,
-            userId: p.user_id,
-            matchId: p.match_id,
-            homeScore: Number(p.home_score),
-            awayScore: Number(p.away_score),
-            pointsEarned: p.points_earned !== null ? Number(p.points_earned) : undefined,
-            groupId: p.group_id || null,
-          }));
+          // Predictions: only those belonging to a bolão the user can see.
+          // null group_id (legacy) stays visible — it predates group scoping.
+          const mappedPredictions = (data || [])
+            .filter((p: any) => !p.group_id || visibleGroupIds.has(p.group_id))
+            .map((p: any) => ({
+              id: p.id,
+              userId: p.user_id,
+              matchId: p.match_id,
+              homeScore: Number(p.home_score),
+              awayScore: Number(p.away_score),
+              pointsEarned: p.points_earned !== null ? Number(p.points_earned) : undefined,
+              groupId: p.group_id || null,
+            }));
           return res.json({ success: true, data: mappedPredictions });
         }
         if (tableName === "copabolao_comments") {
           const { data, error } = await supabase.from("copabolao_comments").select("*");
           if (error) return res.json({ success: false, error: "Erro ao consultar comentários." });
-          const mappedComments = (data || []).map((c: any) => ({
-            id: c.id,
-            matchId: c.match_id,
-            groupId: c.group_id ?? null,
-            userId: c.user_id,
-            userName: c.user_name,
-            userAvatar: c.user_avatar,
-            text: c.text,
-            timestamp: c.timestamp,
-            reactions: c.reactions || [],
-          }));
+          // Same group scope rule: only show comments from accessible bolões,
+          // plus the legacy null-groupId rows.
+          const mappedComments = (data || [])
+            .filter((c: any) => !c.group_id || visibleGroupIds.has(c.group_id))
+            .map((c: any) => ({
+              id: c.id,
+              matchId: c.match_id,
+              groupId: c.group_id ?? null,
+              userId: c.user_id,
+              userName: c.user_name,
+              userAvatar: c.user_avatar,
+              text: c.text,
+              timestamp: c.timestamp,
+              reactions: c.reactions || [],
+            }));
           return res.json({ success: true, data: mappedComments });
         }
         if (tableName === "copabolao_events") {
@@ -1231,16 +1287,21 @@ Responda APENAS o JSON.`;
             }
             return res.json({ success: false, error: "Erro ao consultar eventos." });
           }
-          const mapped = (data || []).map((e: any) => ({
-            id: e.id,
-            type: e.type,
-            groupId: e.group_id ?? null,
-            actorId: e.actor_id ?? null,
-            targetId: e.target_id ?? null,
-            matchId: e.match_id ?? null,
-            payload: e.payload || {},
-            createdAt: e.created_at,
-          }));
+          const mapped = (data || [])
+            // Same scope rule the client enforces: events from a bolão the user
+            // can't see are stripped server-side. Global events (groupId null)
+            // pass through — they're not bolão-specific.
+            .filter((e: any) => !e.group_id || visibleGroupIds.has(e.group_id))
+            .map((e: any) => ({
+              id: e.id,
+              type: e.type,
+              groupId: e.group_id ?? null,
+              actorId: e.actor_id ?? null,
+              targetId: e.target_id ?? null,
+              matchId: e.match_id ?? null,
+              payload: e.payload || {},
+              createdAt: e.created_at,
+            }));
           return res.json({ success: true, data: mapped });
         }
         return res.json({ success: false, error: "Tabela inválida." });
@@ -1338,6 +1399,9 @@ Responda APENAS o JSON.`;
 
       const mappedGroups = (gRes.data || [])
         .filter((g: any) => g.deleted !== true)
+        // Same scope rule as the table-specific path: members can see their
+        // own groups + all public ones (Explore tab) + the default group.
+        .filter((g: any) => visibleGroupIds.has(g.id) || g.is_private !== true)
         .map((g: any) => ({
           id: g.id,
           name: g.name,
@@ -1350,27 +1414,31 @@ Responda APENAS o JSON.`;
           isPrivate: g.is_private === true,
         }));
 
-      const mappedPredictions = (pRes.data || []).map((p: any) => ({
-        id: p.id,
-        userId: p.user_id,
-        matchId: p.match_id,
-        homeScore: Number(p.home_score),
-        awayScore: Number(p.away_score),
-        pointsEarned: p.points_earned !== null ? Number(p.points_earned) : undefined,
-        groupId: p.group_id || null,
-      }));
+      const mappedPredictions = (pRes.data || [])
+        .filter((p: any) => !p.group_id || visibleGroupIds.has(p.group_id))
+        .map((p: any) => ({
+          id: p.id,
+          userId: p.user_id,
+          matchId: p.match_id,
+          homeScore: Number(p.home_score),
+          awayScore: Number(p.away_score),
+          pointsEarned: p.points_earned !== null ? Number(p.points_earned) : undefined,
+          groupId: p.group_id || null,
+        }));
 
-      const mappedComments = (cRes.data || []).map((c: any) => ({
-        id: c.id,
-        matchId: c.match_id,
-        groupId: c.group_id ?? null,
-        userId: c.user_id,
-        userName: c.user_name,
-        userAvatar: c.user_avatar,
-        text: c.text,
-        timestamp: c.timestamp,
-        reactions: c.reactions || [],
-      }));
+      const mappedComments = (cRes.data || [])
+        .filter((c: any) => !c.group_id || visibleGroupIds.has(c.group_id))
+        .map((c: any) => ({
+          id: c.id,
+          matchId: c.match_id,
+          groupId: c.group_id ?? null,
+          userId: c.user_id,
+          userName: c.user_name,
+          userAvatar: c.user_avatar,
+          text: c.text,
+          timestamp: c.timestamp,
+          reactions: c.reactions || [],
+        }));
 
       const mappedMatches = (mRes.data || []).map((m: any) => ({
         id: m.id,
@@ -1864,21 +1932,44 @@ Responda APENAS o JSON.`;
         return res.status(404).json({ success: false, message: "Bolão não encontrado para esse código." });
       }
 
-      const members: string[] = Array.isArray(group.members) ? group.members : [];
-      if (members.includes(authUser.email)) {
-        return res.json({ success: true, group, alreadyMember: true });
-      }
-      const updatedMembers = [...members, authUser.email];
+      const existingMembers: string[] = Array.isArray(group.members) ? group.members : [];
+      const wasAlreadyMember = existingMembers.includes(authUser.email);
 
-      const { data: updated, error: updateErr } = await supabase
-        .from("copabolao_groups")
-        .update({ members: updatedMembers })
-        .eq("id", group.id)
-        .select()
-        .single();
-      if (updateErr) {
-        logError("groups-join-update", updateErr);
-        return res.json({ success: false, message: "Erro ao atualizar membros." });
+      // Atomic add via Postgres RPC. Avoids the race where two concurrent joins
+      // each read `members`, push their own email locally, and the second write
+      // silently overwrites the first. Falls back to read-modify-write when the
+      // RPC isn't installed yet (during migration).
+      let updated: any = null;
+      const { data: rpcRows, error: rpcErr } = await supabase
+        .rpc("copabolao_group_add_member", { p_group_id: group.id, p_user_email: authUser.email });
+
+      if (rpcErr) {
+        const msg = String(rpcErr.message || "").toLowerCase();
+        const fnMissing = msg.includes("does not exist") || msg.includes("could not find");
+        if (!fnMissing) {
+          logError("groups-join-rpc", rpcErr);
+          return res.json({ success: false, message: "Erro ao atualizar membros." });
+        }
+        // Legacy path — race exists but is preferable to a hard failure during migration.
+        const { data: legacyUpdated, error: legacyErr } = await supabase
+          .from("copabolao_groups")
+          .update({ members: [...existingMembers, authUser.email] })
+          .eq("id", group.id)
+          .select()
+          .single();
+        if (legacyErr) {
+          logError("groups-join-update", legacyErr);
+          return res.json({ success: false, message: "Erro ao atualizar membros." });
+        }
+        updated = legacyUpdated;
+      } else {
+        // Supabase wraps SETOF returns in an array even when the RPC yields
+        // exactly one row. Pick the first (the updated group).
+        updated = Array.isArray(rpcRows) ? rpcRows[0] : rpcRows;
+      }
+
+      if (wasAlreadyMember) {
+        return res.json({ success: true, group: updated, alreadyMember: true });
       }
 
       // Feed event: someone joined this bolão. Idempotent on (group, user) so
@@ -2377,13 +2468,14 @@ Responda APENAS o JSON.`;
       return res.status(401).json({ success: false, message: "Autenticação necessária." });
     }
 
-    const { targetUserId, requesterUserId } = parsed.data;
-    const normalizedRequesterId = requesterUserId?.toLowerCase() || "";
+    const { targetUserId } = parsed.data;
     const normalizedTargetId = targetUserId?.toLowerCase() || "";
     const isAdmin = isAdminEmail(authUser.email);
-    // authUser.email is the canonical identity for our records (we store users by email).
-    // authUser.id is Supabase's UUID and won't match our 'targetUserId' which is also an email.
-    const isSelf = normalizedTargetId === normalizedRequesterId || authUser.email === normalizedTargetId;
+    // CRITICAL: identity is taken from the JWT (authUser.email), never from the
+    // body. The previous version compared body.requesterUserId against
+    // body.targetUserId, which let any authenticated user delete *any* account
+    // by simply spoofing both fields to the victim's email.
+    const isSelf = authUser.email === normalizedTargetId;
 
     if (!isAdmin && !isSelf) {
       return res.json({ success: false, message: "Apenas administradores ou o próprio usuário podem deletar esta conta." });
