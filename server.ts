@@ -1582,7 +1582,7 @@ Responda APENAS o JSON.`;
     if (!authUser) {
       return res.status(401).json({ success: false, message: "Autenticação necessária." });
     }
-    if (authUser.id !== parsed.data.id && !isAdminEmail(authUser.email)) {
+    if (authUser.email !== parsed.data.id.toLowerCase() && !isAdminEmail(authUser.email)) {
       return res.status(403).json({ success: false, message: "Você só pode modificar seu próprio perfil." });
     }
 
@@ -1619,7 +1619,7 @@ Responda APENAS o JSON.`;
     if (!authUser) {
       return res.status(401).json({ success: false, message: "Autenticação necessária." });
     }
-    if (authUser.id !== parsed.data.userId && !isAdminEmail(authUser.email)) {
+    if (authUser.email !== parsed.data.userId.toLowerCase() && !isAdminEmail(authUser.email)) {
       return res.status(403).json({ success: false, message: "Você só pode modificar seus próprios palpites." });
     }
 
@@ -1704,7 +1704,7 @@ Responda APENAS o JSON.`;
     if (!authUser) {
       return res.status(401).json({ success: false, message: "Autenticação necessária." });
     }
-    if (authUser.id !== parsed.data.creatorId && !isAdminEmail(authUser.email)) {
+    if (authUser.email !== parsed.data.creatorId.toLowerCase() && !isAdminEmail(authUser.email)) {
       return res.status(403).json({ success: false, message: "Você só pode modificar seus próprios grupos." });
     }
 
@@ -1744,7 +1744,7 @@ Responda APENAS o JSON.`;
     if (!authUser) {
       return res.status(401).json({ success: false, message: "Autenticação necessária." });
     }
-    if (authUser.id !== parsed.data.userId && !isAdminEmail(authUser.email)) {
+    if (authUser.email !== parsed.data.userId.toLowerCase() && !isAdminEmail(authUser.email)) {
       return res.status(403).json({ success: false, message: "Você só pode modificar seus próprios comentários." });
     }
 
@@ -1845,7 +1845,11 @@ Responda APENAS o JSON.`;
       return res.status(401).json({ success: false, message: "Autenticação necessária." });
     }
 
-    const { groupId, userId } = parsed.data;
+    // userId from the body is intentionally ignored here — the authoritative
+    // identity is authUser.email (from the JWT), which is what isCreator below
+    // compares against. Kept the schema field for backward compat with older
+    // clients that still send it.
+    const { groupId } = parsed.data;
 
     // Admin can delete the public default group, but `ensureDefaultGroup` recreates it
     // on the next /api/auth/me — useful to zero out memberships/palpites without permanently
@@ -1879,9 +1883,11 @@ Responda APENAS o JSON.`;
         return res.json({ success: true, message: "Removido localmente com sucesso.", mode: "not-found-fallback" });
       }
 
-      const normalizedUserId = userId?.toLowerCase() || "";
       const isAdmin = isAdminEmail(authUser.email);
-      const isCreator = group.creator_id?.toLowerCase() === normalizedUserId;
+      // Authoritative check: compare the group's creator_id with the
+      // authenticated user's email (from the JWT). The body-provided userId
+      // is untrusted — anyone could spoof it. JWT email is what matters.
+      const isCreator = group.creator_id?.toLowerCase() === authUser.email;
 
       if (!isAdmin && !isCreator) {
         return res.json({ success: false, message: "Você não tem permissão para deletar este grupo. Apenas o criador ou o administrador podem deletá-lo." });
@@ -1943,7 +1949,9 @@ Responda APENAS o JSON.`;
     const normalizedRequesterId = requesterUserId?.toLowerCase() || "";
     const normalizedTargetId = targetUserId?.toLowerCase() || "";
     const isAdmin = isAdminEmail(authUser.email);
-    const isSelf = normalizedTargetId === normalizedRequesterId || authUser.id === normalizedTargetId;
+    // authUser.email is the canonical identity for our records (we store users by email).
+    // authUser.id is Supabase's UUID and won't match our 'targetUserId' which is also an email.
+    const isSelf = normalizedTargetId === normalizedRequesterId || authUser.email === normalizedTargetId;
 
     if (!isAdmin && !isSelf) {
       return res.json({ success: false, message: "Apenas administradores ou o próprio usuário podem deletar esta conta." });
