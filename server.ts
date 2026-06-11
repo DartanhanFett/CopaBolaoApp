@@ -332,6 +332,12 @@ async function syncWorldCupMatches(supabase: any): Promise<{ synced: number; err
       existingById.set(row.id, row);
     }
 
+    // Track matches that transitioned from "upcoming" to "completed" *because of
+    // upstream scores* (not admin input — that path runs scoring at click time).
+    // We rescore them after the upsert so user predictions get points without
+    // needing the admin to click anything.
+    const newlyCompletedIds: string[] = [];
+
     const upserts = data.matches.map((m, idx) => {
       // Stable IDs keyed by date + slugged teams. Index suffix protects against
       // theoretical duplicates (same teams on same day in different rounds).
@@ -343,12 +349,42 @@ async function syncWorldCupMatches(supabase: any): Promise<{ synced: number; err
       const dateIso = openFootballToISO(m.date, m.time);
 
       const prior = existingById.get(id);
-      // Live state takes priority over the upstream sync — admin updates via
-      // the Simulator must survive subsequent calendar refreshes.
-      const status = prior?.status && prior.status !== "upcoming" ? prior.status : "upcoming";
-      const homeScore = prior?.home_score ?? null;
-      const awayScore = prior?.away_score ?? null;
-      const scorers = prior?.scorers ?? [];
+
+      // Precedence rules for status / score during sync:
+      //   1. Admin set "completed" or "live" via Simulator → preserve everything.
+      //      The admin is the source of truth — they're watching the game in real
+      //      time and might have entered a score before the OpenFootball PR landed.
+      //   2. Match still "upcoming" on our side, but upstream has a final score
+      //      (m.score.ft = [home, away]) → adopt the upstream score and flip to
+      //      "completed". This is the new path: lets community-maintained scores
+      //      flow in automatically without admin intervention.
+      //   3. Otherwise → keep upcoming, no score. Same behavior as before.
+      const ftScore = m.score?.ft;
+      const adminLocked = prior?.status === "completed" || prior?.status === "live";
+
+      let status: "upcoming" | "live" | "completed";
+      let homeScore: number | null;
+      let awayScore: number | null;
+      let scorers: string[];
+
+      if (adminLocked) {
+        status = prior!.status;
+        homeScore = prior?.home_score ?? null;
+        awayScore = prior?.away_score ?? null;
+        scorers = prior?.scorers ?? [];
+      } else if (Array.isArray(ftScore) && ftScore.length === 2) {
+        status = "completed";
+        homeScore = ftScore[0];
+        awayScore = ftScore[1];
+        scorers = prior?.scorers ?? [];
+        // Brand-new completion (wasn't completed before this sync) → queue rescore.
+        if (prior?.status !== "completed") newlyCompletedIds.push(id);
+      } else {
+        status = "upcoming";
+        homeScore = prior?.home_score ?? null;
+        awayScore = prior?.away_score ?? null;
+        scorers = prior?.scorers ?? [];
+      }
 
       return {
         id,
@@ -375,10 +411,88 @@ async function syncWorldCupMatches(supabase: any): Promise<{ synced: number; err
       }
       total += batch.length;
     }
+
+    // Rescore predictions for each newly-completed match. Sequential (not parallel)
+    // because there are typically 0-2 newly-completed matches per sync — no need
+    // to fan out, and serializing keeps Supabase load predictable.
+    for (const id of newlyCompletedIds) {
+      const result = await rescoreMatch(supabase, id);
+      if (result.error) {
+        logError("worldcup-sync-rescore", `${id}: ${result.error}`);
+      } else {
+        console.log(`[worldcup-sync] rescored ${result.scored} predictions for ${id}`);
+      }
+    }
+
     return { synced: total };
   } catch (err: any) {
     logError("worldcup-sync", err);
     return { synced: 0, error: err?.message || "Erro desconhecido no sync" };
+  }
+}
+
+/**
+ * Recomputes points_earned for every prediction tied to a finished match.
+ * Module-level so that both the admin-triggered POST /api/predictions/score
+ * route and the OpenFootball sync (which can flip a match to "completed"
+ * automatically) can call it. Returns a structured result instead of throwing
+ * — the sync caller treats errors as non-fatal.
+ *
+ * Idempotent: re-scoring an already-scored match just rewrites the same
+ * points_earned values, so racing calls between the cron and a manual click
+ * don't corrupt anything.
+ */
+async function rescoreMatch(supabase: any, matchId: string): Promise<{ scored: number; error?: string }> {
+  try {
+    const { data: matchRow, error: matchErr } = await supabase
+      .from("copabolao_matches")
+      .select("*")
+      .eq("id", matchId)
+      .maybeSingle();
+    if (matchErr || !matchRow) return { scored: 0, error: "match-not-found" };
+    if (matchRow.status !== "completed") return { scored: 0, error: "match-not-completed" };
+
+    const match = {
+      id: matchRow.id,
+      homeTeam: matchRow.home_team,
+      awayTeam: matchRow.away_team,
+      date: matchRow.date,
+      status: matchRow.status as "completed",
+      homeScore: matchRow.home_score !== null ? Number(matchRow.home_score) : undefined,
+      awayScore: matchRow.away_score !== null ? Number(matchRow.away_score) : undefined,
+      scorers: matchRow.scorers || [],
+      league: matchRow.league,
+    };
+
+    const { data: predRows, error: predErr } = await supabase
+      .from("copabolao_predictions")
+      .select("*")
+      .eq("match_id", matchId);
+    if (predErr) return { scored: 0, error: predErr.message };
+
+    const updates = (predRows || []).map((p: any) => {
+      const points = calculatePredictionPoints(
+        { id: p.id, userId: p.user_id, matchId: p.match_id, homeScore: Number(p.home_score), awayScore: Number(p.away_score) },
+        match
+      );
+      return {
+        id: p.id,
+        user_id: p.user_id,
+        match_id: p.match_id,
+        home_score: Number(p.home_score),
+        away_score: Number(p.away_score),
+        points_earned: points,
+        group_id: p.group_id || null,
+      };
+    });
+
+    if (updates.length > 0) {
+      const { error: upsertErr } = await supabase.from("copabolao_predictions").upsert(updates);
+      if (upsertErr) return { scored: 0, error: upsertErr.message };
+    }
+    return { scored: updates.length };
+  } catch (err: any) {
+    return { scored: 0, error: err?.message || "unknown" };
   }
 }
 
@@ -1512,6 +1626,11 @@ Responda APENAS o JSON.`;
    * Triggered by the simulator when a match flips to "completed".
    */
   const scoreMatchBodySchema = z.object({ matchId: z.string().min(1) });
+  // Internal helper that recomputes points_earned for every prediction tied to
+  // a finished match. Reused by:
+  //   - POST /api/predictions/score (admin-triggered, e.g. via the Simulator)
+  //   - syncWorldCupMatches() when OpenFootball flips a match to completed
+  // Returns { scored: <count> } on success or { error } when something blew up.
   app.post("/api/predictions/score", async (req, res) => {
     const parsed = scoreMatchBodySchema.safeParse(req.body);
     if (!parsed.success) {
@@ -1528,76 +1647,14 @@ Responda APENAS o JSON.`;
       return res.status(403).json({ success: false, message: "Apenas administradores podem calcular pontuação." });
     }
 
-    const { matchId } = parsed.data;
-    try {
-      const { data: matchRow, error: matchErr } = await supabase
-        .from("copabolao_matches")
-        .select("*")
-        .eq("id", matchId)
-        .maybeSingle();
-      if (matchErr || !matchRow) {
-        return res.status(404).json({ success: false, message: "Partida não encontrada." });
-      }
-      if (matchRow.status !== "completed") {
-        return res.status(400).json({ success: false, message: "Partida ainda não finalizada." });
-      }
-
-      const match = {
-        id: matchRow.id,
-        homeTeam: matchRow.home_team,
-        awayTeam: matchRow.away_team,
-        date: matchRow.date,
-        status: matchRow.status as "completed",
-        homeScore: matchRow.home_score !== null ? Number(matchRow.home_score) : undefined,
-        awayScore: matchRow.away_score !== null ? Number(matchRow.away_score) : undefined,
-        scorers: matchRow.scorers || [],
-        league: matchRow.league,
-      };
-
-      const { data: predRows, error: predErr } = await supabase
-        .from("copabolao_predictions")
-        .select("*")
-        .eq("match_id", matchId);
-      if (predErr) {
-        logError("score-fetch", predErr);
-        return res.json({ success: false, message: "Erro ao buscar palpites." });
-      }
-
-      const updates = (predRows || []).map((p: any) => {
-        const points = calculatePredictionPoints(
-          {
-            id: p.id,
-            userId: p.user_id,
-            matchId: p.match_id,
-            homeScore: Number(p.home_score),
-            awayScore: Number(p.away_score),
-          },
-          match
-        );
-        return {
-          id: p.id,
-          user_id: p.user_id,
-          match_id: p.match_id,
-          home_score: Number(p.home_score),
-          away_score: Number(p.away_score),
-          points_earned: points,
-          group_id: p.group_id || null,
-        };
-      });
-
-      if (updates.length > 0) {
-        const { error: upsertErr } = await supabase.from("copabolao_predictions").upsert(updates);
-        if (upsertErr) {
-          logError("score-upsert", upsertErr);
-          return res.json({ success: false, message: "Erro ao salvar pontuação." });
-        }
-      }
-
-      return res.json({ success: true, scored: updates.length });
-    } catch (err) {
-      logError("predictions-score", err);
+    const result = await rescoreMatch(supabase, parsed.data.matchId);
+    if (result.error === "match-not-found") return res.status(404).json({ success: false, message: "Partida não encontrada." });
+    if (result.error === "match-not-completed") return res.status(400).json({ success: false, message: "Partida ainda não finalizada." });
+    if (result.error) {
+      logError("predictions-score", result.error);
       return res.json({ success: false, message: "Erro ao calcular pontuação." });
     }
+    return res.json({ success: true, scored: result.scored });
   });
 
   // ─── DB Operations (all protected by auth + Zod validation) ────────────
