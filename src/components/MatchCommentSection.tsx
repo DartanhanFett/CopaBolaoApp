@@ -211,7 +211,13 @@ export default function MatchCommentSection({
                           animate={{ opacity: 1, scale: 1, y: 0 }}
                           exit={{ opacity: 0, scale: 0.85, y: 4 }}
                           transition={{ duration: 0.12 }}
-                          className="absolute bottom-9 left-1/2 -translate-x-1/2 bg-slate-900 border border-slate-700 rounded-full py-1.5 px-2 shadow-xl flex gap-1 z-20"
+                          // Anchor on the side that has more room: comments from "me"
+                          // sit on the right edge of the screen so we open the popover
+                          // toward the left (right-0); other people's comments sit on
+                          // the left edge so we open toward the right (left-0).
+                          // Without this, the centered popover (left-1/2) clipped
+                          // off-screen on phones for left-aligned messages.
+                          className={`absolute bottom-9 ${isMe ? 'right-0' : 'left-0'} bg-slate-900 border border-slate-700 rounded-full py-1.5 px-2 shadow-xl flex gap-1 z-20 max-w-[calc(100vw-2rem)]`}
                         >
                           {AVAILABLE_EMOJIS.map((emoji) => (
                             <button
