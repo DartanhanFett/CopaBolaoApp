@@ -882,15 +882,29 @@ export default function App() {
   };
 
   const handleResetSimulator = async () => {
-    // Calls the admin-only /api/db/reset endpoint, which now ONLY resets matches +
+    // Calls the admin-only /api/db/reset endpoint, which ONLY resets matches +
     // wipes predictions. Groups, comments, and users are preserved so we don't blow
     // away other people's data in shared environments.
+    //
+    // The server requires the typed phrase below verbatim. We mirror that gate here
+    // so a misclick on the simulator button doesn't even reach the API. Keep the
+    // string in sync with RESET_CONFIRMATION_PHRASE in server.ts.
+    const RESET_PHRASE = "RESETAR PALPITES E JOGOS";
+    const typed = window.prompt(
+      `⚠️ Isso apaga TODAS as partidas e TODOS os palpites de TODOS os bolões.\n\nDigite exatamente para confirmar:\n${RESET_PHRASE}`
+    );
+    if (typed === null) return; // user cancelled
+    if (typed.trim() !== RESET_PHRASE) {
+      toast.error("Texto de confirmação não bateu. Reset cancelado.");
+      return;
+    }
+
     try {
       const data = await apiJson<{ success?: boolean; matches?: Match[]; message?: string }>(
         "/api/db/reset",
         {
           method: "POST",
-          body: JSON.stringify({}),
+          body: JSON.stringify({ confirmationPhrase: typed.trim() }),
         }
       );
       if (data.success && data.matches) {

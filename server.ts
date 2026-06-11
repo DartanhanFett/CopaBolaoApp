@@ -37,7 +37,18 @@ const dbSyncQuerySchema = z.object({
 
 const dbResetBodySchema = z.object({
   confirmationToken: z.string().optional(),
+  // Typed-confirmation phrase from the admin UI. Must equal RESET_CONFIRMATION_PHRASE
+  // exactly (case-sensitive) to authorize the destructive wipe. Adds a second
+  // human-in-the-loop barrier on top of the admin-email check so a stray click
+  // (or a curl with a stolen token but no idea of the phrase) can't nuke every
+  // prediction in the database.
+  confirmationPhrase: z.string().optional(),
 });
+
+// The exact text an admin must type into the simulator before /api/db/reset
+// will run. Hardcoded — visible to the client by design (the protection is
+// "you have to copy this and you'll see how scary it is", not secrecy).
+const RESET_CONFIRMATION_PHRASE = "RESETAR PALPITES E JOGOS";
 
 const otpSendBodySchema = z.object({
   email: z.string().email().min(1),
@@ -1499,10 +1510,23 @@ Responda APENAS o JSON.`;
       return res.status(403).json({ success: false, message: "Acesso negado. Apenas administradores podem resetar o banco de dados." });
     }
 
-    // The reset is already gated by (1) Bearer JWT validation and (2) ADMIN_EMAILS check.
-    // We previously also required a RESET_CONFIRMATION_TOKEN, but that doesn't compose with
-    // a browser app — exposing the token to the client would defeat the purpose, and the
-    // simulator UI now has its own visible confirmation step. If you want curl-level
+    // --- TYPED-CONFIRMATION CHECK ---
+    // Even an admin must type the exact phrase. Two reasons:
+    //   1) Defense against a stolen JWT — the attacker would also need to know
+    //      the phrase to wipe every prediction in the system.
+    //   2) Defense against me accidentally clicking "Reset" while showing the
+    //      app to a friend. Typing a sentence is hard to do by accident.
+    if ((parsed.data.confirmationPhrase || "").trim() !== RESET_CONFIRMATION_PHRASE) {
+      return res.status(400).json({
+        success: false,
+        message: `Confirme digitando "${RESET_CONFIRMATION_PHRASE}" no campo de confirmação.`,
+      });
+    }
+
+    // The reset is already gated by (1) Bearer JWT validation and (2) ADMIN_EMAILS check
+    // and (3) the typed-confirmation phrase above. We previously also required a
+    // RESET_CONFIRMATION_TOKEN, but that doesn't compose with a browser app — exposing
+    // the token to the client would defeat the purpose. If you want curl-level
     // protection back, re-add the token check here.
 
     // --- AUDIT LOG ---
@@ -1511,10 +1535,13 @@ Responda APENAS o JSON.`;
     await syncMutex.acquire();
     try {
       // Wipe everything that ties admins to old data:
-      //   - All predictions (they referenced match states we're about to overwrite)
+      //   - All predictions (they referenced match states we're about to overwrite).
+      //     Yes, this nukes predictions across every bolão. The reset is admin-only
+      //     and explicitly typed-confirmed; "destructive" is the whole point. The
+      //     button label and the typed phrase make that clear in the UI.
       //   - All matches (legacy mocks m1..m8, custom_*, real_*, AND wc2026_* — start clean)
       // Then re-pull the canonical World Cup calendar from OpenFootball. Groups,
-      // users, and comments are untouched.
+      // users, comments, and events are untouched.
       await supabase.from("copabolao_predictions").delete().neq("id", "_");
       await supabase.from("copabolao_matches").delete().neq("id", "_");
 
@@ -2089,31 +2116,53 @@ Responda APENAS o JSON.`;
     // Non-admins cannot palpitar after the match has started or within 15 minutes of kickoff.
     if (!isAdminEmail(authUser.email)) {
       try {
-        const { data: match } = await supabase
+        const { data: match, error: lockLookupErr } = await supabase
           .from("copabolao_matches")
           .select("status,date")
           .eq("id", matchId)
           .maybeSingle();
 
-        if (match) {
-          if (match.status !== "upcoming") {
-            return res.status(409).json({
-              success: false,
-              message: "Palpites bloqueados: a partida já começou ou foi finalizada.",
-            });
-          }
-          const kickoff = new Date(match.date).getTime();
-          if (Number.isFinite(kickoff) && Date.now() >= kickoff - 15 * 60 * 1000) {
-            return res.status(409).json({
-              success: false,
-              message: "Palpites bloqueados: faltam menos de 15 minutos para o início da partida.",
-            });
-          }
+        if (lockLookupErr) {
+          // Lookup itself failed (network/db hiccup). Fail closed — better to
+          // briefly block a legit palpite than to let a bypass through.
+          logError("predictions-betlock-lookup", lockLookupErr);
+          return res.status(503).json({
+            success: false,
+            message: "Não consegui validar a partida agora. Tenta de novo em instantes.",
+          });
         }
-        // If the match row is missing, we let the upsert proceed — it could be a custom match
-        // created client-side that hasn't been propagated yet.
+
+        if (!match) {
+          // Unknown match = locked. Custom matches are admin-only (admins
+          // bypass this check at the top of the block); a regular user
+          // referencing a missing matchId is either stale state or a forged
+          // request, and either way they shouldn't write a prediction.
+          return res.status(404).json({
+            success: false,
+            message: "Partida não encontrada. Atualize a tela e tente novamente.",
+          });
+        }
+
+        if (match.status !== "upcoming") {
+          return res.status(409).json({
+            success: false,
+            message: "Palpites bloqueados: a partida já começou ou foi finalizada.",
+          });
+        }
+        const kickoff = new Date(match.date).getTime();
+        if (Number.isFinite(kickoff) && Date.now() >= kickoff - 15 * 60 * 1000) {
+          return res.status(409).json({
+            success: false,
+            message: "Palpites bloqueados: faltam menos de 15 minutos para o início da partida.",
+          });
+        }
       } catch (lockErr) {
         logError("predictions-betlock", lockErr);
+        // Same fail-closed logic as the lookup error above.
+        return res.status(503).json({
+          success: false,
+          message: "Não consegui validar a partida agora. Tenta de novo em instantes.",
+        });
       }
     }
 
