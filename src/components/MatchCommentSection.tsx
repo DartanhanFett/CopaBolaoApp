@@ -25,12 +25,31 @@ export default function MatchCommentSection({
   onClose,
 }: MatchCommentSectionProps) {
   const [newComment, setNewComment] = useState('');
+  // Tracks which comment's "+" reaction popover is open. Mobile has no hover,
+  // so the previous CSS-only `:hover` popover never appeared on touch devices.
+  // null = nothing open; otherwise = comment id.
+  const [reactionPopoverFor, setReactionPopoverFor] = useState<string | null>(null);
   const commentsEndRef = useRef<HTMLDivElement>(null);
 
   // Auto-scroll to bottom when comments list updates
   useEffect(() => {
     commentsEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [comments]);
+
+  // Close the reaction popover when the user taps anywhere outside it.
+  // Without this, opening one and tapping another would leave both visually
+  // suggested as "open" until a re-render. Pointerdown fires before click so
+  // the inner buttons still get to handle their own clicks first.
+  useEffect(() => {
+    if (!reactionPopoverFor) return;
+    const close = (e: PointerEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (target && target.closest('[data-reaction-popover]')) return;
+      setReactionPopoverFor(null);
+    };
+    document.addEventListener('pointerdown', close);
+    return () => document.removeEventListener('pointerdown', close);
+  }, [reactionPopoverFor]);
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -171,22 +190,45 @@ export default function MatchCommentSection({
                       );
                     })}
 
-                    {/* Quick Add Popover inline */}
-                    <div className="relative group/emoji">
-                      <button className="flex items-center justify-center w-6 h-6 rounded-full bg-slate-900 border border-slate-800 text-slate-400 hover:text-slate-200 transition text-[11px]">
+                    {/* Reaction popover. Tap "+" to toggle (mobile-friendly).
+                        The data-reaction-popover attribute lets the click-outside
+                        listener tell taps inside the popover apart from taps elsewhere. */}
+                    <div className="relative" data-reaction-popover>
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setReactionPopoverFor((prev) => (prev === comment.id ? null : comment.id));
+                        }}
+                        className="flex items-center justify-center w-7 h-7 rounded-full bg-slate-900 border border-slate-800 text-slate-400 hover:text-slate-200 active:scale-95 transition text-[11px]"
+                        aria-label="Adicionar reação"
+                      >
                         +
                       </button>
-                      <div className="absolute bottom-7 left-1/2 -translate-x-1/2 bg-slate-900 border border-slate-700 rounded-full py-1 px-2 shadow-xl opacity-0 scale-75 group-hover/emoji:opacity-100 group-hover/emoji:scale-100 pointer-events-none group-hover/emoji:pointer-events-auto transition-all duration-150 flex gap-1 z-20">
-                        {AVAILABLE_EMOJIS.map((emoji) => (
-                          <button
-                            key={emoji}
-                            onClick={() => onToggleReaction(comment.id, emoji)}
-                            className="hover:scale-125 hover:rotate-6 transition active:scale-95 px-1 py-0.5 text-base"
-                          >
-                            {emoji}
-                          </button>
-                        ))}
-                      </div>
+                      {reactionPopoverFor === comment.id && (
+                        <motion.div
+                          initial={{ opacity: 0, scale: 0.85, y: 4 }}
+                          animate={{ opacity: 1, scale: 1, y: 0 }}
+                          exit={{ opacity: 0, scale: 0.85, y: 4 }}
+                          transition={{ duration: 0.12 }}
+                          className="absolute bottom-9 left-1/2 -translate-x-1/2 bg-slate-900 border border-slate-700 rounded-full py-1.5 px-2 shadow-xl flex gap-1 z-20"
+                        >
+                          {AVAILABLE_EMOJIS.map((emoji) => (
+                            <button
+                              key={emoji}
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                onToggleReaction(comment.id, emoji);
+                                setReactionPopoverFor(null);
+                              }}
+                              className="hover:scale-125 active:scale-95 transition px-1 py-0.5 text-lg"
+                            >
+                              {emoji}
+                            </button>
+                          ))}
+                        </motion.div>
+                      )}
                     </div>
                   </div>
                 </motion.div>
